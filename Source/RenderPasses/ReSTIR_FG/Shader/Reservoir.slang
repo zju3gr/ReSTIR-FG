@@ -79,6 +79,30 @@ struct Reservoir{
         return selectSample;
     }
 
+    // Stochastic Pairwise MIS: 合并 Reservoir 时内联计算 pairwise MIS 权重
+    // p_hat_q: 样本在当前像素处的 target function 值
+    // p_hat_neighbor: 样本在邻居像素处的 target function 值
+    // M_q: 当前像素 Reservoir 的 M 值（合并前）
+    [mutating] bool combineReservoirPairwise(in const Reservoir other, const float p_hat_q, const float p_hat_neighbor, const float M_q, const float rnd){
+        // 计算 Pairwise MIS 权重: w = p_hat_q / (p_hat_q + (M_neighbor / M_q) * p_hat_neighbor)
+        float m_ratio = (M_q > 0) ? (float(other.M) / max(1.0, M_q)) : 0.0;
+        float denom = p_hat_q + m_ratio * p_hat_neighbor;
+        float pairwiseWeight = (denom > 1e-8) ? (p_hat_q / denom) : 0.0;
+
+        float risWeight = p_hat_q * other.weightSum * other.M * pairwiseWeight;
+
+        M += other.M;
+        weightSum += risWeight;
+
+        bool selectSample = (rnd * weightSum < risWeight);
+
+        if(selectSample){
+            targetFunc = p_hat_q;
+        }
+
+        return selectSample;
+    }
+
     //Finalizes a sample. Normalizes the Wsum to W (and uses weightSum to store W)
     [mutating] void finalizeSample(float normalizationNumerator, float normalizationDenominator){
         float denominator = targetFunc * normalizationDenominator;

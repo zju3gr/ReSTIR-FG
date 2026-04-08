@@ -16,6 +16,32 @@ import SurfaceDataFG;
 import FinalGatherData;
 
 #define BIAS_CORRECTION 1
+#define BIAS_MODE_PAIRWISE 3
+#define BIAS_MODE_PAIRWISE_STOCHASTIC 4
+
+#ifndef BIAS_CORRECTION_MODE
+    #define BIAS_CORRECTION_MODE 1
+#endif
+
+// Pairwise MIS 辅助函数（参考 Bitterli 2020 / MiniSPMIS）
+float safeDivide(float a, float b)
+{
+    return abs(b) > 0 ? a / b : 0;
+}
+
+float computePairwiseMIS_canonical_beta(float c_i, float c_c, float c_sum, float phat_from_i, float phat_c)
+{
+    return (c_i / max(c_sum, 1e-8)) * safeDivide(
+        c_c * phat_c,
+        c_c * phat_c + c_sum * phat_from_i);
+}
+
+float computePairwiseMIS_noncanonical(float c_i, float c_c, float c_sum, float phat_from_i, float phat_c)
+{
+    return safeDivide(
+        c_i * phat_from_i,
+        c_sum * phat_from_i + c_c * phat_c);
+}
 
 #if USE_REDUCED_RESERVOIR_FORMAT
     RWTexture2D<uint2> gReservoir[2];
@@ -49,6 +75,8 @@ cbuffer Constant
     float gNormalThreshold;         //Maximum cosine between both Normals that is allowed
     uint gDisocclusionBoostSamples; // Number of spatial samples if no temporal surface was found
     float2 gPhotonRadius;            //Caustic Photon Radius
+    uint gPairwiseMIS_M;            //Pairwise MIS: 虚拟总候选数 M (覆盖 c_sum), 0 = 使用实际值
+    uint gPairwiseMIS_N;            //Pairwise MIS: 实际采样邻居数 N (覆盖 numSamples), 0 = 使用 gSpatialSamples
 }
 
 static const float kRayEpsilon = 0.99f;
@@ -74,6 +102,9 @@ SurfaceFG getSurface(uint2 idx, bool prev)
 
 void temporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r, inout CausticSample causticSample, in SurfaceFG surface, uint buffIdx = 0)
 {
+    uint M_canonical = r.M; // 保存 canonical 的 M 值
+    float W_canonical = r.weightSum; // 保存 canonical 的 W 值
+    float p_hat_canonical = r.targetFunc; // 保存 canonical 的 target function
     uint historyLimit = gMaxAge * r.M;
 
     //Reproject to the previous pixel using the motion vectors
@@ -147,7 +178,54 @@ void temporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r
             if (distance(cauPrev.pos, surface.posW) > gPhotonRadius[buffIdx])
                 targetFunc = 0;
 
+#if BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE || BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE_STOCHASTIC
+            // Pairwise MIS: 计算邻居样本在邻居处的 target function
+            float p_hat_neighbor = 0.0;
+            {
+                float NdotL_n = dot(cauPrev.dir, temporalSurface.normal);
+                if (NdotL_n > kMinCosTheta)
+                    p_hat_neighbor = temporalSurface.getPdf(cauPrev.dir, luminance(cauPrev.flux)) / NdotL_n;
+                if (distance(cauPrev.pos, temporalSurface.posW) > gPhotonRadius[buffIdx])
+                    p_hat_neighbor = 0.0;
+            }
+
+            // 计算 canonical 样本在邻居位置的 target function
+            float p_hat_canonical_at_neighbor = 0.0;
+            {
+                float NdotL_cn = dot(causticSample.dir, temporalSurface.normal);
+                if (NdotL_cn > kMinCosTheta)
+                    p_hat_canonical_at_neighbor = temporalSurface.getPdf(causticSample.dir, luminance(causticSample.flux)) / NdotL_cn;
+                if (distance(causticSample.pos, temporalSurface.posW) > gPhotonRadius[buffIdx])
+                    p_hat_canonical_at_neighbor = 0.0;
+            }
+
+            // c_c = M_canonical, c_i = prev.M, c_sum = prev.M (只有一个邻居)
+            float c_c = float(M_canonical);
+            float c_i = float(prev.M);
+            float c_sum = gPairwiseMIS_M > 0 ? float(gPairwiseMIS_M) : c_i;
+
+            // Canonical MIS 权重
+            float m_c = computePairwiseMIS_canonical_beta(c_i, c_c, c_sum, p_hat_canonical_at_neighbor, p_hat_canonical);
+
+            // Non-canonical MIS 权重
+            float m_i = computePairwiseMIS_noncanonical(c_i, c_c, c_sum, p_hat_neighbor, targetFunc);
+
+            // 手动计算 w_sum
+            float w_sum = m_c * p_hat_canonical * W_canonical;
+            float w_i = m_i * targetFunc * prev.weightSum;
+            w_sum += w_i;
+
+            // RIS 选择
+            r.M += prev.M;
+            r.weightSum = w_sum;
+            if (w_sum > 0 && sampleNext1D(sg) * w_sum < w_i)
+            {
+                selectPrevSample = true;
+                r.targetFunc = targetFunc;
+            }
+#else
             selectPrevSample = r.combineReservoir(prev, targetFunc, sampleNext1D(sg));
+#endif
         }
 
         if (selectPrevSample)
@@ -156,7 +234,10 @@ void temporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r
 
 
     //Bias correction via MIS
-#if BIAS_CORRECTION
+#if BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE || BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE_STOCHASTIC
+    // Pairwise MIS: 直接 finalize，MIS 权重已内联处理
+    r.finalizeSample(1.0f, 1.0f);
+#elif BIAS_CORRECTION
     float pi = r.targetFunc;
     float piSum = r.targetFunc; //piSum = target * M_initial ; M_initial is always 1 for us
 
@@ -180,6 +261,10 @@ void temporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r
 
 void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r, inout CausticSample causticSample, in SurfaceFG surface, uint buffIdx = 0)
 {
+    uint M_canonical = r.M; // 保存 canonical 的 M 值
+    float W_canonical = r.weightSum; // 保存 canonical 的 W 值
+    float p_hat_canonical = r.targetFunc; // 保存 canonical 的 target function
+    CausticSample causticCanonical = causticSample; // 保存原始 canonical 样本
     uint historyLimit = gMaxAge;
 
     //Check if motion vectors are inside of the frame
@@ -233,7 +318,8 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
     //Spartio Temporal Resampling
     //
     
-    uint numSamples = foundTemporalSurface ? gSpatialSamples + 1 : max(gSpatialSamples + 1, gDisocclusionBoostSamples);
+    uint spatialCountST = gPairwiseMIS_N > 0 ? gPairwiseMIS_N : gSpatialSamples;
+    uint numSamples = foundTemporalSurface ? spatialCountST + 1 : max(spatialCountST + 1, gDisocclusionBoostSamples);
     numSamples = clamp(numSamples, 1, 8); //Cap at 8 samples for the later bias correction
     uint cachedIndices[8]; //Store all indeces. 32 Bits per 2D index (16 per element)
     uint cachedM[4];
@@ -241,10 +327,23 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
     int selectedSample = -1;
     bool validSample = true;
 
+    // Pairwise MIS 缓存数组
+    float cachedTargetFunc[8];
+    float cachedPhatNeighbor[8];
+    float cachedW[8];
+    CausticSample cachedCaustic[8];
+    uint cachedReservoirM[8];
+    float c_sum = 0.0;
+    uint validCount = 0;
+
     //Go through all neighbors
     for (uint i = 0; i < numSamples; i++)
     {
         cachedIndices[i] = 0xFFFFFFFF; //Set to max int
+        cachedReservoirM[i] = 0;
+        cachedTargetFunc[i] = 0;
+        cachedPhatNeighbor[i] = 0;
+        cachedW[i] = 0;
         if (i % 2 == 0)
             cachedM[i / 2] = 0;
         int2 idx = int2(0);
@@ -308,16 +407,149 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
             if (distance(cauPrev.pos, surface.posW) > gPhotonRadius[buffIdx])
                 targetFunc = 0;
         }
+
+#if BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE || BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE_STOCHASTIC
+        // Pairwise MIS: 缓存邻居数据
+        float p_hat_neighbor = 0.0;
+        if (sampledReservoir.M > 0)
+        {
+            uint2 neighIdx = uint2((cachedIndices[i] >> 16) & 0xFFFF, (cachedIndices[i] & 0xFFFF));
+            SurfaceFG neighSurface = getSurface(neighIdx, true);
+            if (neighSurface.valid)
+            {
+                float NdotL_n = dot(cauPrev.dir, neighSurface.normal);
+                if (NdotL_n > kMinCosTheta)
+                    p_hat_neighbor = neighSurface.getPdf(cauPrev.dir, luminance(cauPrev.flux)) / NdotL_n;
+                if (distance(cauPrev.pos, neighSurface.posW) > gPhotonRadius[buffIdx])
+                    p_hat_neighbor = 0.0;
+            }
+        }
+        cachedTargetFunc[i] = targetFunc;
+        cachedPhatNeighbor[i] = p_hat_neighbor;
+        cachedW[i] = sampledReservoir.weightSum;
+        cachedCaustic[i] = cauPrev;
+        cachedReservoirM[i] = sampledReservoir.M;
+        c_sum += float(sampledReservoir.M);
+        validCount++;
+        r.M += sampledReservoir.M;
+#else
         //Combine Reservoirs
         if (r.combineReservoir(sampledReservoir, targetFunc, sampleNext1D(sg)))
         {
             selectedSample = i;
             causticSample = cauPrev;
         }
+#endif
     }
 
   //Bias correction
-    #if BIAS_CORRECTION
+    // 当 gPairwiseMIS_M > 0 时，用虚拟总候选数 M 覆盖实际的 c_sum
+    float final_c_sum = gPairwiseMIS_M > 0 ? float(gPairwiseMIS_M) : c_sum;
+    #if BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE
+    {
+        float c_c = float(M_canonical);
+
+        // 标准 Pairwise MIS: 遍历所有邻居计算 canonical MIS 权重 m_c
+        float m_c = 0.0;
+        if (p_hat_canonical > 0 && validCount > 0)
+        {
+            for (uint j = 0; j < numSamples; j++)
+            {
+                if (cachedReservoirM[j] == 0) continue;
+                // canonical 样本在邻居 j 位置的 target function
+                uint2 neighIdx = uint2((cachedIndices[j] >> 16) & 0xFFFF, (cachedIndices[j] & 0xFFFF));
+                SurfaceFG neighSurface = getSurface(neighIdx, true);
+                float p_hat_canonical_at_j = 0.0;
+                if (neighSurface.valid)
+                {
+                    float NdotL_cn = dot(causticCanonical.dir, neighSurface.normal);
+                    if (NdotL_cn > kMinCosTheta)
+                        p_hat_canonical_at_j = neighSurface.getPdf(causticCanonical.dir, luminance(causticCanonical.flux)) / NdotL_cn;
+                    if (distance(causticCanonical.pos, neighSurface.posW) > gPhotonRadius[buffIdx])
+                        p_hat_canonical_at_j = 0.0;
+                }
+                m_c += computePairwiseMIS_canonical_beta(float(cachedReservoirM[j]), c_c, final_c_sum, p_hat_canonical_at_j, p_hat_canonical);
+            }
+        }
+
+        // w_sum 从 canonical 开始
+        float w_sum = m_c * p_hat_canonical * W_canonical;
+
+        // 累加每个邻居的贡献
+        for (uint j = 0; j < numSamples; j++)
+        {
+            if (cachedReservoirM[j] == 0) continue;
+            float m_i = computePairwiseMIS_noncanonical(float(cachedReservoirM[j]), c_c, final_c_sum, cachedPhatNeighbor[j], cachedTargetFunc[j]);
+            float w_i = m_i * cachedTargetFunc[j] * cachedW[j];
+            w_sum += w_i;
+            if (w_sum > 0 && sampleNext1D(sg) * w_sum < w_i)
+            {
+                selectedSample = j;
+                causticSample = cachedCaustic[j];
+                r.targetFunc = cachedTargetFunc[j];
+            }
+        }
+
+        r.weightSum = w_sum;
+        r.finalizeSample(1.0f, 1.0f);
+    }
+    #elif BIAS_CORRECTION_MODE == BIAS_MODE_PAIRWISE_STOCHASTIC
+    {
+        float c_c = float(M_canonical);
+
+        // Stochastic Pairwise MIS: 用单个随机邻居估计 canonical MIS 权重 m_c
+        float m_c = 0.0;
+        if (p_hat_canonical > 0 && validCount > 0)
+        {
+            // 随机选一个有效邻居来估计 canonical 权重
+            uint randomIdx = min(uint(sampleNext1D(sg) * numSamples), numSamples - 1);
+            uint attempts = 0;
+            while (cachedReservoirM[randomIdx] == 0 && attempts < numSamples)
+            {
+                randomIdx = (randomIdx + 1) % numSamples;
+                attempts++;
+            }
+            if (cachedReservoirM[randomIdx] > 0)
+            {
+                uint2 neighIdx = uint2((cachedIndices[randomIdx] >> 16) & 0xFFFF, (cachedIndices[randomIdx] & 0xFFFF));
+                SurfaceFG neighSurface = getSurface(neighIdx, true);
+                float p_hat_canonical_at_j = 0.0;
+                if (neighSurface.valid)
+                {
+                    float NdotL_cn = dot(causticCanonical.dir, neighSurface.normal);
+                    if (NdotL_cn > kMinCosTheta)
+                        p_hat_canonical_at_j = neighSurface.getPdf(causticCanonical.dir, luminance(causticCanonical.flux)) / NdotL_cn;
+                    if (distance(causticCanonical.pos, neighSurface.posW) > gPhotonRadius[buffIdx])
+                        p_hat_canonical_at_j = 0.0;
+                }
+                // selectionW = validCount（均匀采样的无偏估计因子）
+                float selectionW = float(validCount);
+                m_c = selectionW * computePairwiseMIS_canonical_beta(float(cachedReservoirM[randomIdx]), c_c, final_c_sum, p_hat_canonical_at_j, p_hat_canonical);
+            }
+        }
+
+        // w_sum 从 canonical 开始
+        float w_sum = m_c * p_hat_canonical * W_canonical;
+
+        // 累加每个邻居的贡献（non-canonical 部分与标准版相同）
+        for (uint j = 0; j < numSamples; j++)
+        {
+            if (cachedReservoirM[j] == 0) continue;
+            float m_i = computePairwiseMIS_noncanonical(float(cachedReservoirM[j]), c_c, final_c_sum, cachedPhatNeighbor[j], cachedTargetFunc[j]);
+            float w_i = m_i * cachedTargetFunc[j] * cachedW[j];
+            w_sum += w_i;
+            if (w_sum > 0 && sampleNext1D(sg) * w_sum < w_i)
+            {
+                selectedSample = j;
+                causticSample = cachedCaustic[j];
+                r.targetFunc = cachedTargetFunc[j];
+            }
+        }
+
+        r.weightSum = w_sum;
+        r.finalizeSample(1.0f, 1.0f);
+    }
+    #elif BIAS_CORRECTION
         float pi = r.targetFunc;
         float piSum = r.targetFunc; //piSum = target * M_initial
         

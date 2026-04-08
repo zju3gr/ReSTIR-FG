@@ -110,6 +110,8 @@ namespace
         {(uint)ReSTIR_FG::BiasCorrectionMode::Off, "Off"},
         {(uint)ReSTIR_FG::BiasCorrectionMode::Basic, "Basic"},
         {(uint)ReSTIR_FG::BiasCorrectionMode::RayTraced, "RayTraced"},
+        {(uint)ReSTIR_FG::BiasCorrectionMode::PairwiseMIS, "Pairwise MIS"},
+        {(uint)ReSTIR_FG::BiasCorrectionMode::PairwiseMISStochastic, "Pairwise MIS (Stochastic)"},
     };
 
     const Gui::DropdownList kRenderModeList{
@@ -625,6 +627,14 @@ void ReSTIR_FG::renderUI(Gui::Widgets& widget)
             changed |= group.dropdown("ResamplingMode", kResamplingModeList, (uint&)mResamplingMode);
 
             changed |= group.dropdown("BiasCorrection", kBiasCorrectionModeList, (uint&)mBiasCorrectionMode);
+
+            if (mBiasCorrectionMode == BiasCorrectionMode::PairwiseMIS || mBiasCorrectionMode == BiasCorrectionMode::PairwiseMISStochastic)
+            {
+                changed |= group.var("Pairwise M (virtual candidates)", mPairwiseMIS_M, 0u, 1024u, 1u);
+                group.tooltip("Pairwise MIS: virtual total candidate count M (overrides c_sum in MIS formula). 0 = use actual accumulated M from neighbors");
+                changed |= group.var("Pairwise N (actual samples)", mPairwiseMIS_N, 0u, 32u, 1u);
+                group.tooltip("Pairwise MIS: actual spatial neighbor count N (overrides gSpatialSamples for Pairwise MIS). 0 = use gSpatialSamples");
+            }
 
             changed |= group.var("Depth Threshold", mRelativeDepthThreshold, 0.0f, 1.0f, 0.0001f);
             group.tooltip("Relative depth threshold. 0.1 = within 10% of current depth (linZ)");
@@ -1733,6 +1743,8 @@ void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& 
      var[uniformName]["gDisocclusionBoostSamples"] = mDisocclusionBoostSamples;
      var[uniformName]["gAttenuationRadius"] = mSampleRadiusAttenuation;
      var[uniformName]["gJacobianMinMax"] = mJacobianMinMax;
+     var[uniformName]["gPairwiseMIS_M"] = mPairwiseMIS_M;
+     var[uniformName]["gPairwiseMIS_N"] = mPairwiseMIS_N;
 
      // Execute
      const uint2 targetDim = renderData.getDefaultTextureDims();
@@ -1767,6 +1779,7 @@ void ReSTIR_FG::causticResamplingPass(RenderContext* pRenderContext, const Rende
         defines.add("MODE_SPATIOTEMPORAL", mCausticResamplingMode == ResamplingMode::SpartioTemporal ? "1" : "0");
         defines.add("MODE_TEMPORAL", mCausticResamplingMode == ResamplingMode::Temporal ? "1" : "0");
         defines.add("RESERVOIR_PHOTON_DIRECT", mCausticResamplingForFGDirect ? "1" : "0");
+        defines.add("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
         defines.add(getMaterialDefines());
 
         mpCausticResamplingPass = ComputePass::create(mpDevice, desc, defines, true);
@@ -1779,6 +1792,7 @@ void ReSTIR_FG::causticResamplingPass(RenderContext* pRenderContext, const Rende
      mpCausticResamplingPass->getProgram()->addDefine("MODE_TEMPORAL", mCausticResamplingMode == ResamplingMode::Temporal ? "1" : "0");
      mpCausticResamplingPass->getProgram()->addDefine("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
      mpCausticResamplingPass->getProgram()-> addDefine("RESERVOIR_PHOTON_DIRECT", mCausticResamplingForFGDirect ? "1" : "0");
+     mpCausticResamplingPass->getProgram()->addDefine("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
      mpCausticResamplingPass->getProgram()->addDefines(getMaterialDefines());
 
      // Set variables
@@ -1830,6 +1844,8 @@ void ReSTIR_FG::causticResamplingPass(RenderContext* pRenderContext, const Rende
      var[uniformName]["gNormalThreshold"] = mNormalThreshold;
      var[uniformName]["gDisocclusionBoostSamples"] = mDisocclusionBoostSamples;
      var[uniformName]["gPhotonRadius"] = float2(mPhotonCollectRadius.y,mPhotonCollectRadius.x);    //Caustic Radius
+     var[uniformName]["gPairwiseMIS_M"] = mPairwiseMIS_M;
+     var[uniformName]["gPairwiseMIS_N"] = mPairwiseMIS_N;
 
      // Execute
      const uint2 targetDim = renderData.getDefaultTextureDims();

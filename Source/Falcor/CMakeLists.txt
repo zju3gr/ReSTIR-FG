@@ -796,6 +796,7 @@ target_compile_options(Falcor
             /Zi                             # generate debug symbols
             /WX                             # warnings as errors
             /W4                             # increase warning level
+            /wd4819                         # file contains characters that cannot be represented in current code page (936)
             /wd4251                         # 'type' : class 'type1' needs to have dll-interface to be used by clients of class 'type2'
             /wd4244                         # 'conversion' conversion from 'type1' to 'type2', possible loss of data
             /wd4267                         # 'var' : conversion from 'size_t' to 'type', possible loss of data
