@@ -153,9 +153,13 @@ private:
      */
     void collectPhotonsSplit(RenderContext* pRenderContext, const RenderData& renderData, ShaderVar& var, std::string profileName, bool fg);
 
-    /** World Space Hash Grid ¹¹½¨Á÷³Ì
+    /** World Space Hash Grid æ„å»ºæµç¨‹
     */
     void buildWorldSpaceHashGrid(RenderContext* pRenderContext, const RenderData& renderData);
+
+    /** Tile Guide æ›´æ–°æµç¨‹ï¼šä» Reservoir winner ç´¯ç§¯æ–¹å‘ä¿¡æ¯å¹¶ä¸å†å²æ··åˆ
+    */
+    void updateTileGuide(RenderContext* pRenderContext, const RenderData& renderData);
 
     /** Resampling pass, which resamples the generated sampled based on the resampling mode
     */
@@ -243,14 +247,20 @@ private:
     float mNormalThreshold = 0.6f;                                  // Cosine of maximum angle between both normals allowed
     float2 mJacobianMinMax = float2(1 / 10.f, 10.f);                // Min and Max values that are allowed for the jacobian determinant (Angle/dist too different if lower/higher)
     BiasCorrectionMode mBiasCorrectionMode = BiasCorrectionMode::RayTraced; // Bias Correction Mode
-    uint mPairwiseMIS_M = 0;                                    // Pairwise MIS: ĞéÄâ×ÜºòÑ¡Êı M (¸²¸Ç c_sum), 0 = Ê¹ÓÃÊµ¼ÊÖµ
-    uint mPairwiseMIS_N = 0;                                    // Pairwise MIS: Êµ¼Ê²ÉÑùÁÚ¾ÓÊı N (¸²¸Ç gSpatialSamples), 0 = Ê¹ÓÃ gSpatialSamples
+    uint mPairwiseMIS_M = 0;                                    // Pairwise MIS: è™šæ‹Ÿæ€»å€™é€‰æ•° M (è¦†ç›– c_sum), 0 = ä½¿ç”¨å®é™…å€¼
+    uint mPairwiseMIS_N = 0;                                    // Pairwise MIS: å®é™…é‡‡æ ·é‚»å±…æ•° N (è¦†ç›– gSpatialSamples), 0 = ä½¿ç”¨ gSpatialSamples
     bool mUseCausticsForIndirectLight = true;                  // Use Caustic photons as indirect light samples
 
     // World Space Hash Grid
-    bool mUseWorldSpaceHashGrid = false;                        // ÆôÓÃ World Space Hash Grid ½øĞĞ spatial resampling
-    uint mHashGridDimension = 80;                               // Hash Grid ³¡¾°»®·ÖÎ¬¶È
-    uint mHashTableSize = 100000;                               // Hash Table ´óĞ¡£¨cell ÊıÁ¿£©
+    bool mUseWorldSpaceHashGrid = false;                        // å¯ç”¨ World Space Hash Grid è¿›è¡Œ spatial resampling
+    uint mHashGridDimension = 80;                               // Hash Grid åœºæ™¯åˆ’åˆ†ç»´åº¦
+    uint mHashTableSize = 100000;                               // Hash Table å¤§å°ï¼ˆcell æ•°é‡ï¼‰
+
+    // Tile Guide
+    bool mUseTileGuide = false;                                 // å¯ç”¨ Tile-Guided Gather Ray
+    uint mTileSize = 16;                                        // Tile å¤§å°ï¼ˆåƒç´ ï¼‰
+    float mTileGuideBeta = 0.3f;                                // æ··åˆæ¦‚ç‡ beta (guide é‡‡æ ·æ¦‚ç‡)
+    float mTileGuideTemporalAlpha = 0.2f;                       // æ—¶é—´æ··åˆç³»æ•° alpha (æ–°å¸§æƒé‡)
 
 
     //Photon
@@ -342,11 +352,15 @@ private:
     ref<Buffer> mpSampleGenState;       //SampleGeneratorState
 
     // World Space Hash Grid Buffers
-    ref<Buffer> mpHashAppendBuffer[2];   // Ã¿¸öÏñËØµÄ HashAppendData
-    ref<Buffer> mpHashCellStorage[2];    // Cell ´æ´¢£¨ÏñËØË÷ÒıÊı×é£©
-    ref<Buffer> mpHashIndexBuffer[2];    // PrefixSum ºóµÄ cell ÆğÊ¼Æ«ÒÆ
+    ref<Buffer> mpHashAppendBuffer[2];   // æ¯ä¸ªåƒç´ çš„ HashAppendData
+    ref<Buffer> mpHashCellStorage[2];    // Cell å­˜å‚¨ï¼ˆåƒç´ ç´¢å¼•æ•°ç»„ï¼‰
+    ref<Buffer> mpHashIndexBuffer[2];    // PrefixSum åçš„ cell èµ·å§‹åç§»
     ref<Buffer> mpHashCheckSumBuffer[2]; // Hash table checksum
-    ref<Buffer> mpHashCellCounters[2];   // Cell ¼ÆÊıÆ÷
+    ref<Buffer> mpHashCellCounters[2];   // Cell è®¡æ•°å™¨
+
+    // Tile Guide Buffers
+    ref<Buffer> mpTileGuideBuffer[2];        // åŒç¼“å†² tile guide (æ¯ä¸ª tile 17 ä¸ª float)
+    ref<Buffer> mpPixelGuideBinWeight;       // Per-pixel ä¸­é—´æ•°æ® (binIndex, weight)
 
     ref<Texture> mpVBufferDI;          // Work copy for VBuffer (RTXDI or DirectAnalytical)
     ref<Texture> mpViewDirRayDistDI;   // View dir tex (RTXDI or DirectAnalytical)
@@ -385,9 +399,11 @@ private:
     RayTraceProgramHelper mGeneratePhotonPass;
     RayTraceProgramHelper mCollectPhotonPass;
 
-    std::unique_ptr<PrefixSum> mpPrefixSum;              // PrefixSum ÓÃÓÚ Hash Grid ¹¹½¨
-    ref<ComputePass> mpRegisterHashGridPass;             // ×¢²áÏñËØµ½ Hash Grid
-    ref<ComputePass> mpBuildHashGridPass;                // ¹¹½¨ Hash Grid Cell Storage
+    std::unique_ptr<PrefixSum> mpPrefixSum;              // PrefixSum ç”¨äº Hash Grid æ„å»º
+    ref<ComputePass> mpRegisterHashGridPass;             // æ³¨å†Œåƒç´ åˆ° Hash Grid
+    ref<ComputePass> mpBuildHashGridPass;                // æ„å»º Hash Grid Cell Storage
+    ref<ComputePass> mpAccumulateTileGuidePass;          // Tile Guide ç´¯ç§¯ pass
+    ref<ComputePass> mpBlendTileGuidePass;               // Tile Guide æ··åˆ pass
     ref<ComputePass> mpResamplingPass;                  // Resampling Pass for all resampling modes
     ref<ComputePass> mpCausticResamplingPass;           // Resampling Pass for Caustics
     ref<ComputePass> mpFinalShadingPass;                // Final Shading Pass

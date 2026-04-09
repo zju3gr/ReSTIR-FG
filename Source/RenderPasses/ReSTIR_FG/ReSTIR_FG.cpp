@@ -43,6 +43,7 @@ namespace
     const std::string kDirectAnalyticPassShader = "RenderPasses/ReSTIR_FG/Shader/DirectAnalytic.cs.slang";
     const std::string kRegisterHashGridShader = "RenderPasses/ReSTIR_FG/Shader/RegisterHashGrid.cs.slang";
     const std::string kBuildHashGridShader = "RenderPasses/ReSTIR_FG/Shader/BuildHashGrid.cs.slang";
+    const std::string kUpdateTileGuideShader = "RenderPasses/ReSTIR_FG/Shader/UpdateTileGuide.cs.slang";
 
     const std::string kShaderModel = "6_5";
     const uint kMaxPayloadBytes = 96u;
@@ -344,6 +345,12 @@ void ReSTIR_FG::execute(RenderContext* pRenderContext, const RenderData& renderD
     {
         buildWorldSpaceHashGrid(pRenderContext, renderData);
         resamplingPass(pRenderContext, renderData);
+    }
+
+    // 更新 Tile Guide（在 resampling 完成后，使用 reservoir winner 信息）
+    if (mUseTileGuide && (mRenderMode == RenderMode::ReSTIRFG || mRenderMode == RenderMode::FinalGather))
+    {
+        updateTileGuide(pRenderContext, renderData);
     }
 
     if (mReservoirValid && mCausticCollectMode == CausticCollectionMode::Reservoir &&
@@ -691,6 +698,27 @@ void ReSTIR_FG::renderUI(Gui::Widgets& widget)
                 }
             }
 
+            if (auto group2 = group.group("Tile Guide"))
+            {
+                bool prevTileGuide = mUseTileGuide;
+                changed |= group2.checkbox("Enable Tile-Guided Gather Ray", mUseTileGuide);
+                if (prevTileGuide != mUseTileGuide)
+                {
+                    mFinalGatherSamplePass.pVars.reset(); // 需要重新创建以更新 shader defines
+                }
+                group2.tooltip("Use Tile-based directional guide to mix BSDF sampling with guided sampling. "
+                    "Reservoir winners from previous frames build a per-tile directional histogram to guide gather ray direction.");
+                if (mUseTileGuide)
+                {
+                    changed |= group2.var("Beta (Guide Probability)", mTileGuideBeta, 0.0f, 1.0f, 0.01f);
+                    group2.tooltip("Probability of using tile guide sampling vs BSDF sampling. 0 = pure BSDF, 1 = pure guide.");
+                    changed |= group2.var("Temporal Alpha", mTileGuideTemporalAlpha, 0.01f, 1.0f, 0.01f);
+                    group2.tooltip("Exponential moving average weight for new frame data. Lower = more history, higher = more responsive.");
+                    changed |= group2.var("Tile Size", mTileSize, 4u, 64u, 4u);
+                    group2.tooltip("Tile size in pixels. Smaller = more tiles, finer guide but more memory.");
+                }
+            }
+
             mRebuildReservoirBuffer |= group.checkbox("Use reduced Reservoir format", mUseReducedReservoirFormat);
             group.tooltip(
                 "If enabled uses RG32_UINT instead of RGBA32_UINT. In reduced format the targetFunc and M only have 16 bits while the "
@@ -755,6 +783,8 @@ void ReSTIR_FG::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpCausticResamplingPass.reset();
     mpRegisterHashGridPass.reset();
     mpBuildHashGridPass.reset();
+    mpAccumulateTileGuidePass.reset();
+    mpBlendTileGuidePass.reset();
     mpEmissiveLightSampler.reset();
     mpGIEmissiveLightSampler.reset();
     mpRTXDI.reset();
@@ -913,7 +943,9 @@ void ReSTIR_FG::prepareBuffers(RenderContext* pRenderContext, const RenderData& 
             mpHashCheckSumBuffer[i].reset();
             mpHashCellCounters[i].reset();
             mpHashIndexBuffer[i].reset();
+            mpTileGuideBuffer[i].reset();
         }
+        mpPixelGuideBinWeight.reset();
         mpFinalGatherSampleHitData.reset();
         mpVBuffer.reset();
         mpViewDir.reset();
@@ -981,6 +1013,42 @@ void ReSTIR_FG::prepareBuffers(RenderContext* pRenderContext, const RenderData& 
 
         if (!mpPrefixSum)
             mpPrefixSum = std::make_unique<PrefixSum>(mpDevice);
+    }
+
+    // Tile Guide Buffers
+    if (mUseTileGuide)
+    {
+        uint2 tileDim = uint2((mScreenRes.x + mTileSize - 1) / mTileSize, (mScreenRes.y + mTileSize - 1) / mTileSize);
+        uint totalTiles = tileDim.x * tileDim.y;
+        uint floatsPerTile = 17; // 16 bins + 1 totalWeight
+        uint32_t tileBufferSize = totalTiles * floatsPerTile * sizeof(float);
+        uint32_t pixelCount = mScreenRes.x * mScreenRes.y;
+
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            if (!mpTileGuideBuffer[i] || mpTileGuideBuffer[i]->getSize() != tileBufferSize)
+            {
+                mpTileGuideBuffer[i] = Buffer::createStructured(mpDevice, sizeof(float), totalTiles * floatsPerTile,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpTileGuideBuffer[i]->setName("ReSTIR_FG::TileGuide" + std::to_string(i));
+                // 初始化为 0
+                pRenderContext->clearUAV(mpTileGuideBuffer[i]->getUAV().get(), uint4(0));
+            }
+        }
+
+        if (!mpPixelGuideBinWeight || mpPixelGuideBinWeight->getElementCount() != pixelCount)
+        {
+            mpPixelGuideBinWeight = Buffer::createStructured(mpDevice, sizeof(uint32_t) * 2, pixelCount,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+            mpPixelGuideBinWeight->setName("ReSTIR_FG::PixelGuideBinWeight");
+        }
+    }
+    else
+    {
+        // 如果关闭了 Tile Guide，释放 buffer
+        for (uint32_t i = 0; i < 2; i++)
+            mpTileGuideBuffer[i].reset();
+        mpPixelGuideBinWeight.reset();
     }
 
     //If reservoir format changed reset buffer
@@ -1412,6 +1480,7 @@ void ReSTIR_FG::getFinalGatherHitPass(RenderContext* pRenderContext, const Rende
     mFinalGatherSamplePass.pProgram->addDefine("USE_PHOTON_CULLING", mUsePhotonCulling ? "1" : "0");
     mFinalGatherSamplePass.pProgram->addDefine("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
     mFinalGatherSamplePass.pProgram->addDefine("USE_CAUSTIC_CULLING", (mCausticCollectMode != CausticCollectionMode::None) && mUseCausticCulling ? "1" : "0");
+    mFinalGatherSamplePass.pProgram->addDefine("USE_TILE_GUIDE", mUseTileGuide ? "1" : "0");
     mFinalGatherSamplePass.pProgram->addDefines(getMaterialDefines());
         
     if (!mFinalGatherSamplePass.pVars)
@@ -1430,6 +1499,14 @@ void ReSTIR_FG::getFinalGatherHitPass(RenderContext* pRenderContext, const Rende
     var[nameBuf]["gHashScaleFactor"] = 1.f / (2 * hashRad); // Hash Scale
     var[nameBuf]["gAttenuationRadius"] = mSampleRadiusAttenuation;
 
+    // Tile Guide PerFrame 参数（始终设置，避免 cbuffer 未初始化）
+    {
+        uint2 tileDim = uint2((mScreenRes.x + mTileSize - 1) / mTileSize, (mScreenRes.y + mTileSize - 1) / mTileSize);
+        var[nameBuf]["gTileGuideBeta"] = mUseTileGuide ? mTileGuideBeta : 0.0f;
+        var[nameBuf]["gTileDim"] = tileDim;
+        var[nameBuf]["gTileSize"] = mTileSize;
+    }
+
     nameBuf = "Constant";
     var[nameBuf]["gHashSize"] = 1 << mCullingHashBufferSizeBits;
     var[nameBuf]["gUseAlphaTest"] = mPhotonUseAlphaTest;
@@ -1444,6 +1521,14 @@ void ReSTIR_FG::getFinalGatherHitPass(RenderContext* pRenderContext, const Rende
     var["gSurfaceData"] = mpSurfaceBuffer[mFrameCount % 2];
     var["gFinalGatherHit"] = mpFinalGatherSampleHitData;
     var["gPhotonCullingMask"] = mpPhotonCullingMask;
+
+    // Tile Guide buffer 绑定
+    if (mUseTileGuide && mpTileGuideBuffer[0])
+    {
+        // 使用上一帧的 tile guide (已混合历史)
+        uint prevIdx = (mFrameCount + 1) % 2;
+        var["gTileGuideBuffer"] = mpTileGuideBuffer[prevIdx];
+    }
 
     FALCOR_ASSERT(mScreenRes.x > 0 && mScreenRes.y > 0);
 
@@ -1844,6 +1929,99 @@ void ReSTIR_FG::buildWorldSpaceHashGrid(RenderContext* pRenderContext, const Ren
     // UAV barrier 确保构建完成
     pRenderContext->uavBarrier(mpHashCellStorage[idxCurr].get());
     pRenderContext->uavBarrier(mpHashIndexBuffer[idxCurr].get());
+}
+
+void ReSTIR_FG::updateTileGuide(RenderContext* pRenderContext, const RenderData& renderData) {
+    if (!mUseTileGuide)
+        return;
+
+    FALCOR_PROFILE(pRenderContext, "UpdateTileGuide");
+
+    uint2 tileDim = uint2((mScreenRes.x + mTileSize - 1) / mTileSize, (mScreenRes.y + mTileSize - 1) / mTileSize);
+    uint totalTiles = tileDim.x * tileDim.y;
+
+    // 确定 reservoir 索引（与 finalShadingPass 使用相同的索引）
+    uint reservoirIndex = mResamplingMode == ResamplingMode::Spatial ? (mFrameCount + 1) % 2 : mFrameCount % 2;
+    uint currGuideIdx = mFrameCount % 2;
+    uint prevGuideIdx = (mFrameCount + 1) % 2;
+
+    // === Pass 1: 每个像素计算 bin index 和 weight ===
+    {
+        if (!mpAccumulateTileGuidePass)
+        {
+            Program::Desc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kUpdateTileGuideShader).csEntry("accumulateTileGuide").setShaderModel(kShaderModel);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines;
+            defines.add(mpScene->getSceneDefines());
+            defines.add("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
+            defines.add(getMaterialDefines());
+            mpAccumulateTileGuidePass = ComputePass::create(mpDevice, desc, defines, true);
+        }
+
+        mpAccumulateTileGuidePass->getProgram()->addDefine("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
+        mpAccumulateTileGuidePass->getProgram()->addDefines(getMaterialDefines());
+
+        auto var = mpAccumulateTileGuidePass->getRootVar();
+
+        var["gReservoir"] = mpReservoirBuffer[reservoirIndex];
+        var["gFGSampleData"] = mpFGSampelDataBuffer[reservoirIndex];
+        var["gSurfaceData"] = mpSurfaceBuffer[mFrameCount % 2];
+        var["gView"] = mpViewDir;
+        var["gPixelGuideBinWeight"] = mpPixelGuideBinWeight;
+
+        std::string uniformName = "TileGuideCB";
+        var[uniformName]["gFrameDim"] = mScreenRes;
+        var[uniformName]["gTileDim"] = tileDim;
+        var[uniformName]["gTileSize"] = mTileSize;
+        var[uniformName]["gTemporalAlpha"] = mTileGuideTemporalAlpha;
+        var[uniformName]["gAttenuationRadius"] = mSampleRadiusAttenuation;
+        var[uniformName]["gFrameCount"] = mFrameCount;
+
+        mpAccumulateTileGuidePass->execute(pRenderContext, uint3(mScreenRes, 1));
+    }
+
+    pRenderContext->uavBarrier(mpPixelGuideBinWeight.get());
+
+    // === Pass 2: 每个 tile 汇总并与历史混合 ===
+    {
+        if (!mpBlendTileGuidePass)
+        {
+            Program::Desc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kUpdateTileGuideShader).csEntry("blendTileGuide").setShaderModel(kShaderModel);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines;
+            defines.add(mpScene->getSceneDefines());
+            defines.add("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
+            defines.add(getMaterialDefines());
+            mpBlendTileGuidePass = ComputePass::create(mpDevice, desc, defines, true);
+        }
+
+        mpBlendTileGuidePass->getProgram()->addDefine("USE_REDUCED_RESERVOIR_FORMAT", mUseReducedReservoirFormat ? "1" : "0");
+        mpBlendTileGuidePass->getProgram()->addDefines(getMaterialDefines());
+
+        auto var = mpBlendTileGuidePass->getRootVar();
+
+        var["gPixelGuideBinWeight"] = mpPixelGuideBinWeight;
+        var["gTileGuidePrev"] = mpTileGuideBuffer[prevGuideIdx];
+        var["gTileGuideOut"] = mpTileGuideBuffer[currGuideIdx];
+
+        std::string uniformName = "TileGuideCB";
+        var[uniformName]["gFrameDim"] = mScreenRes;
+        var[uniformName]["gTileDim"] = tileDim;
+        var[uniformName]["gTileSize"] = mTileSize;
+        var[uniformName]["gTemporalAlpha"] = mTileGuideTemporalAlpha;
+        var[uniformName]["gAttenuationRadius"] = mSampleRadiusAttenuation;
+        var[uniformName]["gFrameCount"] = mFrameCount;
+
+        mpBlendTileGuidePass->execute(pRenderContext, uint3(totalTiles, 1, 1));
+    }
+
+    pRenderContext->uavBarrier(mpTileGuideBuffer[currGuideIdx].get());
 }
 
 void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& renderData) {

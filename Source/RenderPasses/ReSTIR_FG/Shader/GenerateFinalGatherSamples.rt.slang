@@ -17,6 +17,7 @@ import Reservoir;
 import FinalGatherData;
 import SurfaceDataFG;
 import Hash;
+import TileGuide;
 
 cbuffer PerFrame
 {
@@ -24,7 +25,9 @@ cbuffer PerFrame
     float2 gCollectionRadius;
     float gHashScaleFactor; //Hash scale factor. 1/diameter
     float gAttenuationRadius;
-    uint3 _pad;
+    float gTileGuideBeta;   // Tile Guide 混合概率 beta
+    uint2 gTileDim;         // Tile 网格维度
+    uint gTileSize;         // Tile 大小（像素）
 }
 
 cbuffer Constant{
@@ -52,8 +55,14 @@ RWTexture2D<uint> gPhotonCullingMask;
     RWTexture2D<uint4> gReservoir;
 #endif
 
+// Tile Guide buffer (只读)
+#if USE_TILE_GUIDE
+    StructuredBuffer<float> gTileGuideBuffer;
+#endif
+
 static const bool kUsePhotonCulling = USE_PHOTON_CULLING;
-static const bool kUseCausticPhotons = USE_CAUSTIC_CULLING; 
+static const bool kUseCausticPhotons = USE_CAUSTIC_CULLING;
+static const bool kUseTileGuide = USE_TILE_GUIDE;
 
 struct TraceData
 {
@@ -190,16 +199,80 @@ void rayGen()
         //Fill Surface Buffer used for calculating the target PDF
         surface = SurfaceFG::create(sd.computeNewRayOrigin(), bsdfProperties.guideNormal, sd.V, viewDepth, bsdfProperties.roughness,
                                       luminance(bsdfProperties.diffuseReflectionAlbedo), luminance(bsdfProperties.specularReflectance));
-        
-        reservoir.targetFunc = surface.getPdf(bsdfSample.wo);
+
+        // === Tile-Guided Mixture Sampling ===
+        float3 finalWo = bsdfSample.wo;
+        float finalSelectPdf = bsdfSample.pdf;
+
+#if USE_TILE_GUIDE
+        if (validSample)
+        {
+            // 加载当前像素所在 tile 的 guide
+            uint2 tileCoord = launchIndex / gTileSize;
+            uint tileIndex = tileCoord.x + tileCoord.y * gTileDim.x;
+            TileGuideData tileGuide = loadTileGuide(gTileGuideBuffer, tileIndex);
+
+            float beta = gTileGuideBeta;
+
+            // 如果 guide 无效，退化为纯 BSDF
+            if (!tileGuide.valid)
+                beta = 0.0;
+
+            float u = sampleNext1D(sg);
+
+            if (u < beta)
+            {
+                // Tile Guide Sampling: 从直方图 importance sample 方向
+                float guidePdf;
+                float2 rnd2 = sampleNext2D(sg);
+                float rnd1 = sampleNext1D(sg);
+                float3 guideWo = tileGuide.sampleDirection(rnd1, rnd2, guidePdf);
+
+                // 检查方向是否在上半球
+                if (dot(guideWo, sd.faceN) > 0.0 && guidePdf > 0.0)
+                {
+                    // 计算 BSDF 在该方向的 PDF
+                    float bsdfPdfAtGuide = bsdf.evalPdf(sd, guideWo);
+
+                    // Mixture PDF: p_mix = beta * p_guide + (1-beta) * p_bsdf
+                    float mixPdf = beta * guidePdf + (1.0 - beta) * bsdfPdfAtGuide;
+
+                    if (mixPdf > 1e-8)
+                    {
+                        finalWo = guideWo;
+                        finalSelectPdf = mixPdf;
+                    }
+                }
+                // 如果 guide 方向无效，回退到 BSDF 方向
+                else
+                {
+                    float guidePdfAtBsdf = tileGuide.evalPdf(bsdfSample.wo);
+                    finalSelectPdf = beta * guidePdfAtBsdf + (1.0 - beta) * bsdfSample.pdf;
+                    if (finalSelectPdf < 1e-8) finalSelectPdf = bsdfSample.pdf;
+                }
+            }
+            else
+            {
+                // BSDF Sampling: 使用已采样的 bsdfSample.wo
+                // 计算 guide 在该方向的 PDF
+                float guidePdfAtBsdf = tileGuide.evalPdf(bsdfSample.wo);
+
+                // Mixture PDF
+                finalSelectPdf = beta * guidePdfAtBsdf + (1.0 - beta) * bsdfSample.pdf;
+                if (finalSelectPdf < 1e-8) finalSelectPdf = bsdfSample.pdf;
+            }
+        }
+#endif // USE_TILE_GUIDE
+
+        reservoir.targetFunc = surface.getPdf(finalWo);
     
-        reservoir.weightSum = 1.f / bsdfSample.pdf; // 1/selectPDF
+        reservoir.weightSum = 1.f / finalSelectPdf; // 1/mixturePDF
 
         RayDesc tRay;
         tRay.Origin = sd.computeNewRayOrigin();
         tRay.TMin = 0.0001f;
         tRay.TMax = 10000.f;
-        tRay.Direction = bsdfSample.wo;
+        tRay.Direction = finalWo;
     
         if (validSample)
         {
