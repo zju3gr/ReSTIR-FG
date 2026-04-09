@@ -28,6 +28,7 @@
 #include "ReSTIR_FG.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Utils/Math/FalcorMath.h"
 
 namespace
 {
@@ -40,6 +41,8 @@ namespace
     const std::string kCausticResamplingPassShader = "RenderPasses/ReSTIR_FG/Shader/CausticResamplingPass.cs.slang";
     const std::string kFinalShadingPassShader = "RenderPasses/ReSTIR_FG/Shader/FinalShading.cs.slang";
     const std::string kDirectAnalyticPassShader = "RenderPasses/ReSTIR_FG/Shader/DirectAnalytic.cs.slang";
+    const std::string kRegisterHashGridShader = "RenderPasses/ReSTIR_FG/Shader/RegisterHashGrid.cs.slang";
+    const std::string kBuildHashGridShader = "RenderPasses/ReSTIR_FG/Shader/BuildHashGrid.cs.slang";
 
     const std::string kShaderModel = "6_5";
     const uint kMaxPayloadBytes = 96u;
@@ -338,7 +341,10 @@ void ReSTIR_FG::execute(RenderContext* pRenderContext, const RenderData& renderD
 
     //Do resampling
     if ((mRenderMode == RenderMode::ReSTIRFG) || (mRenderMode == RenderMode::ReSTIRGI))
+    {
+        buildWorldSpaceHashGrid(pRenderContext, renderData);
         resamplingPass(pRenderContext, renderData);
+    }
 
     if (mReservoirValid && mCausticCollectMode == CausticCollectionMode::Reservoir &&
         (mRenderMode == RenderMode::ReSTIRFG || mRenderMode == RenderMode::FinalGather))
@@ -666,6 +672,25 @@ void ReSTIR_FG::renderUI(Gui::Widgets& widget)
                 group2.tooltip("Pixel radius for the Spatial Samples");
             }
 
+            if (auto group2 = group.group("World Space Hash Grid"))
+            {
+                bool prevHashGrid = mUseWorldSpaceHashGrid;
+                changed |= group2.checkbox("Enable Hash Grid Spatial", mUseWorldSpaceHashGrid);
+                if (prevHashGrid != mUseWorldSpaceHashGrid)
+                {
+                    mpResamplingPass.reset(); // 需要重新创建以更新 shader 反射信息
+                }
+                group2.tooltip("Use World Space Hash Grid for spatial neighbor lookup instead of screen space random sampling. "
+                    "Neighbors are found by 3D position + normal direction, providing better quality spatial reuse.");
+                if (mUseWorldSpaceHashGrid)
+                {
+                    changed |= group2.var("Grid Dimension", mHashGridDimension, 1u, 300u);
+                    group2.tooltip("Scene grid subdivision dimension. Controls the minimum cell size (sceneBB / dimension).");
+                    changed |= group2.var("Hash Table Size", mHashTableSize, 10000u, 500000u, 10000u);
+                    group2.tooltip("Number of cells in the hash table. Larger = fewer collisions but more memory.");
+                }
+            }
+
             mRebuildReservoirBuffer |= group.checkbox("Use reduced Reservoir format", mUseReducedReservoirFormat);
             group.tooltip(
                 "If enabled uses RG32_UINT instead of RGBA32_UINT. In reduced format the targetFunc and M only have 16 bits while the "
@@ -728,6 +753,8 @@ void ReSTIR_FG::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpFinalShadingPass.reset();
     mpResamplingPass.reset();
     mpCausticResamplingPass.reset();
+    mpRegisterHashGridPass.reset();
+    mpBuildHashGridPass.reset();
     mpEmissiveLightSampler.reset();
     mpGIEmissiveLightSampler.reset();
     mpRTXDI.reset();
@@ -881,6 +908,11 @@ void ReSTIR_FG::prepareBuffers(RenderContext* pRenderContext, const RenderData& 
             mpCausticSample[i].reset();
             mpDirectFGReservoir[i].reset();
             mpDirectFGSample[i].reset();
+            mpHashAppendBuffer[i].reset();
+            mpHashCellStorage[i].reset();
+            mpHashCheckSumBuffer[i].reset();
+            mpHashCellCounters[i].reset();
+            mpHashIndexBuffer[i].reset();
         }
         mpFinalGatherSampleHitData.reset();
         mpVBuffer.reset();
@@ -904,6 +936,51 @@ void ReSTIR_FG::prepareBuffers(RenderContext* pRenderContext, const RenderData& 
     if (mpSampleGenState && !mStoreSampleGenState)
     {
         mpSampleGenState.reset();
+    }
+
+    // World Space Hash Grid Buffers
+    if (mUseWorldSpaceHashGrid)
+    {
+        uint32_t elementCount = mScreenRes.x * mScreenRes.y;
+        // HashAppendData: 4 * uint = 16 bytes per pixel
+        uint32_t hashBufferByteSize = mHashTableSize * 32 * sizeof(uint32_t); // checksum/counter/index buffer size
+
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            if (!mpHashAppendBuffer[i] || mpHashAppendBuffer[i]->getElementCount() != elementCount)
+            {
+                mpHashAppendBuffer[i] = Buffer::createStructured(mpDevice, sizeof(uint32_t) * 4, elementCount,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpHashAppendBuffer[i]->setName("ReSTIR_FG::HashAppendBuffer" + std::to_string(i));
+            }
+            if (!mpHashCellStorage[i] || mpHashCellStorage[i]->getElementCount() != elementCount)
+            {
+                mpHashCellStorage[i] = Buffer::createStructured(mpDevice, sizeof(uint32_t), elementCount,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpHashCellStorage[i]->setName("ReSTIR_FG::HashCellStorage" + std::to_string(i));
+            }
+            if (!mpHashCheckSumBuffer[i])
+            {
+                mpHashCheckSumBuffer[i] = Buffer::create(mpDevice, hashBufferByteSize,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpHashCheckSumBuffer[i]->setName("ReSTIR_FG::HashCheckSum" + std::to_string(i));
+            }
+            if (!mpHashCellCounters[i])
+            {
+                mpHashCellCounters[i] = Buffer::create(mpDevice, hashBufferByteSize,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpHashCellCounters[i]->setName("ReSTIR_FG::HashCellCounters" + std::to_string(i));
+            }
+            if (!mpHashIndexBuffer[i])
+            {
+                mpHashIndexBuffer[i] = Buffer::create(mpDevice, hashBufferByteSize,
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+                mpHashIndexBuffer[i]->setName("ReSTIR_FG::HashIndexBuffer" + std::to_string(i));
+            }
+        }
+
+        if (!mpPrefixSum)
+            mpPrefixSum = std::make_unique<PrefixSum>(mpDevice);
     }
 
     //If reservoir format changed reset buffer
@@ -1662,6 +1739,113 @@ void ReSTIR_FG::collectPhotonsSplit(RenderContext* pRenderContext, const RenderD
      mpScene->raytrace(pRenderContext, mCollectPhotonPass.pProgram.get(), mCollectPhotonPass.pVars, uint3(targetDim, 1));
 }
 
+void ReSTIR_FG::buildWorldSpaceHashGrid(RenderContext* pRenderContext, const RenderData& renderData) {
+    if (!mUseWorldSpaceHashGrid)
+        return;
+
+    FALCOR_PROFILE(pRenderContext, "BuildWorldSpaceHashGrid");
+
+    uint idxCurr = mFrameCount % 2;
+
+    // 清除当前帧的 hash grid buffers
+    pRenderContext->clearUAV(mpHashCheckSumBuffer[idxCurr]->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(mpHashCellCounters[idxCurr]->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(mpHashIndexBuffer[idxCurr]->getUAV().get(), uint4(0));
+
+    // === Pass 1: 注册像素到 Hash Grid ===
+    {
+        if (!mpRegisterHashGridPass)
+        {
+            Program::Desc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kRegisterHashGridShader).csEntry("main").setShaderModel(kShaderModel);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines;
+            defines.add(mpScene->getSceneDefines());
+            defines.add("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
+            defines.add(getMaterialDefines());
+            mpRegisterHashGridPass = ComputePass::create(mpDevice, desc, defines, true);
+        }
+
+        auto var = mpRegisterHashGridPass->getRootVar();
+
+        var["gSurface"] = mpSurfaceBuffer[idxCurr];
+        var["gView"] = mpViewDir;
+        var["gAppendBuffer"] = mpHashAppendBuffer[idxCurr];
+        var["gCheckSumBuffer"] = mpHashCheckSumBuffer[idxCurr];
+        var["gCellCounters"] = mpHashCellCounters[idxCurr];
+
+        // 计算场景参数
+        const auto& bounds = mpScene->getSceneBounds();
+        float3 sceneBBMin = bounds.minPoint - float3(0.1f, 0.1f, 0.1f);
+        float3 boundingSize = abs((bounds.maxPoint - bounds.minPoint) / static_cast<float>(mHashGridDimension));
+        float minCellSize = std::max(boundingSize.x, std::max(boundingSize.y, boundingSize.z));
+        float fov = Falcor::focalLengthToFovY(mpScene->getCamera()->getFocalLength(), Camera::kDefaultFrameHeight);
+
+        std::string uniformName = "HashGridCB";
+        var[uniformName]["gFrameDim"] = mScreenRes;
+        var[uniformName]["gCameraPos"] = mpScene->getCamera()->getPosition();
+        var[uniformName]["gFov"] = fov;
+        var[uniformName]["gSceneBBMin"] = sceneBBMin;
+        var[uniformName]["gMinCellSize"] = minCellSize;
+        var[uniformName]["gHashTableSize"] = mHashTableSize;
+
+        mpRegisterHashGridPass->execute(pRenderContext, uint3(mScreenRes, 1));
+    }
+
+    // UAV barrier 确保注册完成
+    pRenderContext->uavBarrier(mpHashCellCounters[idxCurr].get());
+    pRenderContext->uavBarrier(mpHashCheckSumBuffer[idxCurr].get());
+    pRenderContext->uavBarrier(mpHashAppendBuffer[idxCurr].get());
+
+    // === Pass 2: PrefixSum 计算 cell 起始偏移 ===
+    {
+        // 复制 cell counters 到 index buffer
+        pRenderContext->copyBufferRegion(
+            mpHashIndexBuffer[idxCurr].get(), 0,
+            mpHashCellCounters[idxCurr].get(), 0,
+            mpHashCellCounters[idxCurr]->getSize()
+        );
+
+        // 执行 PrefixSum
+        uint32_t hashBufferElementCount = mHashTableSize * 32;
+        mpPrefixSum->execute(pRenderContext, mpHashIndexBuffer[idxCurr], hashBufferElementCount);
+    }
+
+    // === Pass 3: 构建 Cell Storage ===
+    {
+        if (!mpBuildHashGridPass)
+        {
+            Program::Desc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kBuildHashGridShader).csEntry("main").setShaderModel(kShaderModel);
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines;
+            defines.add(mpScene->getSceneDefines());
+            defines.add("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
+            defines.add(getMaterialDefines());
+            mpBuildHashGridPass = ComputePass::create(mpDevice, desc, defines, true);
+        }
+
+        auto var = mpBuildHashGridPass->getRootVar();
+
+        var["gAppendBuffer"] = mpHashAppendBuffer[idxCurr];
+        var["gIndexBuffer"] = mpHashIndexBuffer[idxCurr];
+        var["gCellStorage"] = mpHashCellStorage[idxCurr];
+
+        std::string uniformName = "BuildCB";
+        var[uniformName]["gFrameDim"] = mScreenRes;
+
+        mpBuildHashGridPass->execute(pRenderContext, uint3(mScreenRes, 1));
+    }
+
+    // UAV barrier 确保构建完成
+    pRenderContext->uavBarrier(mpHashCellStorage[idxCurr].get());
+    pRenderContext->uavBarrier(mpHashIndexBuffer[idxCurr].get());
+}
+
 void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& renderData) {
      std::string profileName = "SpatiotemporalResampling";
      if (mResamplingMode == ResamplingMode::Temporal)
@@ -1686,6 +1870,7 @@ void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& 
         defines.add("MODE_TEMPORAL", mResamplingMode == ResamplingMode::Temporal ? "1" : "0");
         defines.add("MODE_SPATIAL", mResamplingMode == ResamplingMode::Spatial ? "1" : "0");
         defines.add("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
+        defines.add("USE_WORLD_SPACE_HASH_GRID", mUseWorldSpaceHashGrid ? "1" : "0");
         defines.add(getMaterialDefines());
 
         mpResamplingPass = ComputePass::create(mpDevice, desc, defines, true);
@@ -1699,6 +1884,7 @@ void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& 
      mpResamplingPass->getProgram()->addDefine("MODE_SPATIAL", mResamplingMode == ResamplingMode::Spatial ? "1" : "0");
      mpResamplingPass->getProgram()->addDefine("BIAS_CORRECTION_MODE", std::to_string((uint)mBiasCorrectionMode));
      mpResamplingPass->getProgram()->addDefine("USE_REDUCED_RESERVOIR_FORMAT" ,mUseReducedReservoirFormat ? "1" : "0");
+     mpResamplingPass->getProgram()->addDefine("USE_WORLD_SPACE_HASH_GRID", mUseWorldSpaceHashGrid ? "1" : "0");
      mpResamplingPass->getProgram()->addDefines(getMaterialDefines());
      
     // Set variables
@@ -1729,6 +1915,30 @@ void ReSTIR_FG::resamplingPass(RenderContext* pRenderContext, const RenderData& 
      var["gPrevView"] = mpViewDirPrev;
      var["gMVec"] = renderData[kInputMotionVectors]->asTexture();
      var["gSampleGenState"] = mpSampleGenState;
+
+     // World Space Hash Grid buffers
+     if (mUseWorldSpaceHashGrid)
+     {
+        // Hash Grid 始终使用当前帧构建的数据
+        uint hashIdx = mFrameCount % 2;
+        var["gHashCellStorage"] = mpHashCellStorage[hashIdx];
+        var["gHashIndexBuffer"] = mpHashIndexBuffer[hashIdx];
+        var["gHashCheckSumBuffer"] = mpHashCheckSumBuffer[hashIdx];
+        var["gHashCellCounters"] = mpHashCellCounters[hashIdx];
+
+        // 计算场景参数
+        const auto& bounds = mpScene->getSceneBounds();
+        float3 sceneBBMin = bounds.minPoint - float3(0.1f, 0.1f, 0.1f);
+        float3 boundingSize = abs((bounds.maxPoint - bounds.minPoint) / static_cast<float>(mHashGridDimension));
+        float minCellSize = std::max(boundingSize.x, std::max(boundingSize.y, boundingSize.z));
+        float fov = Falcor::focalLengthToFovY(mpScene->getCamera()->getFocalLength(), Camera::kDefaultFrameHeight);
+
+        var["HashGridParams"]["gHashCameraPos"] = mpScene->getCamera()->getPosition();
+        var["HashGridParams"]["gHashFov"] = fov;
+        var["HashGridParams"]["gHashSceneBBMin"] = sceneBBMin;
+        var["HashGridParams"]["gHashMinCellSize"] = minCellSize;
+        var["HashGridParams"]["gHashTableSize"] = mHashTableSize;
+     }
 
      std::string uniformName = "PerFrame";
      var[uniformName]["gFrameCount"] = mFrameCount;

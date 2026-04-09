@@ -15,6 +15,14 @@ import Reservoir;
 import SurfaceDataFG;
 import FinalGatherData;
 
+#ifndef USE_WORLD_SPACE_HASH_GRID
+    #define USE_WORLD_SPACE_HASH_GRID 0
+#endif
+
+#if USE_WORLD_SPACE_HASH_GRID
+import WorldSpaceHashGrid;
+#endif
+
 #if USE_REDUCED_RESERVOIR_FORMAT
     RWTexture2D<uint2> gReservoir;
     Texture2D<uint2> gReservoirPrev;
@@ -31,6 +39,23 @@ Texture2D<float2> gMVec;
 Texture2D<float4> gView;
 Texture2D<float4> gPrevView;
 RWStructuredBuffer<SampleGenerator> gSampleGenState;
+
+// World Space Hash Grid buffers（仅在启用时使用）
+#if USE_WORLD_SPACE_HASH_GRID
+StructuredBuffer<uint> gHashCellStorage;    // Cell 存储（像素索引数组）
+ByteAddressBuffer gHashIndexBuffer;         // PrefixSum 后的 cell 起始偏移
+ByteAddressBuffer gHashCheckSumBuffer;      // Hash table checksum
+ByteAddressBuffer gHashCellCounters;        // Cell 计数器
+
+cbuffer HashGridParams
+{
+    float3 gHashCameraPos;
+    float gHashFov;
+    float3 gHashSceneBBMin;
+    float gHashMinCellSize;
+    uint gHashTableSize;
+};
+#endif
 
 #define BIAS_MODE_BASIC 1
 #define BIAS_MODE_RAYTRACE 2
@@ -343,6 +368,22 @@ void spatialResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r,
     uint validCount = 0;         // 有效邻居数量
 
     //Go through all neighbors
+    // Hash Grid 模式下的邻居查找变量
+#if USE_WORLD_SPACE_HASH_GRID
+    float cellSize = CalculateCellSize(surface.posW, gHashCameraPos, gHashFov, float2(gFrameDim), gHashMinCellSize);
+    float3 jitteredPos = surface.posW + (sampleNext3D(sg) * 2.0f - 1.0f) * 0.1f * cellSize;
+    int cellIdx = FindCell(jitteredPos, surface.normal, cellSize, gHashSceneBBMin, gHashTableSize, gHashCheckSumBuffer);
+    uint cellBaseIdx = 0;
+    uint cellSampleCount = 0;
+    if (cellIdx != -1)
+    {
+        cellBaseIdx = gHashIndexBuffer.Load(uint(cellIdx) * 4);
+        cellSampleCount = gHashCellCounters.Load(uint(cellIdx) * 4);
+    }
+    uint hashIncrement = max(1u, (cellSampleCount + numSamples - 1) / numSamples);
+    uint hashOffset = uint(round(sampleNext1D(sg) * float(max(1u, hashIncrement) - 1)));
+#endif
+
     for (uint i = 0; i < numSamples; i++)
     {
         cachedIndices[i] = 0xFFFFFFFF; //Set to max int
@@ -355,6 +396,35 @@ void spatialResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r,
         
         int2 idx = int2(pixel);
 
+#if USE_WORLD_SPACE_HASH_GRID
+        // World Space Hash Grid 邻居查找
+        if (cellIdx != -1 && cellSampleCount > 0)
+        {
+            uint storageIdx = (hashOffset + i * hashIncrement) % cellSampleCount;
+            uint neighborLinearIdx = gHashCellStorage[cellBaseIdx + storageIdx];
+            idx = int2(neighborLinearIdx % gFrameDim.x, neighborLinearIdx / gFrameDim.x);
+
+            // 跳过自身
+            if (all(idx == int2(pixel)))
+                continue;
+
+            // 边界检查
+            if(any(idx < 0) || any(idx >= gFrameDim))
+                continue;
+
+            // 获取 surface 并检查有效性
+            SurfaceFG neighSurface = getSurface(idx, false);
+            if (!neighSurface.valid)
+                continue;
+
+            if (!surface.isValidNeighbor(neighSurface, gDepthThreshold, gNormalThreshold))
+                continue;
+        }
+        else
+        {
+            continue; // 没有找到 cell，跳过
+        }
+#else
         float2 randSamp = (sampleNext2D(sg) * 2.f) - 1.f; //random sample in [-1,1]
         int2 spatialOffset = int2(round(randSamp * gSamplingRadius));
         idx += spatialOffset;
@@ -370,6 +440,7 @@ void spatialResampling(uint2 pixel, inout SampleGenerator sg, inout Reservoir r,
         
         if (!surface.isValidNeighbor(neighSurface, gDepthThreshold, gNormalThreshold))
             continue;
+#endif
 
         //Neighbor passed the test, start resampling
         Reservoir sampledReservoir = Reservoir(gReservoirPrev[idx]);    //Current reservoir is stored in prev
@@ -668,6 +739,23 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
     uint validCount = 0;
 
     //Go through all neighbors
+    // Hash Grid 模式下的邻居查找变量（用于 spatial 部分）
+#if USE_WORLD_SPACE_HASH_GRID
+    float stCellSize = CalculateCellSize(surface.posW, gHashCameraPos, gHashFov, float2(gFrameDim), gHashMinCellSize);
+    float3 stJitteredPos = surface.posW + (sampleNext3D(sg) * 2.0f - 1.0f) * 0.1f * stCellSize;
+    int stCellIdx = FindCell(stJitteredPos, surface.normal, stCellSize, gHashSceneBBMin, gHashTableSize, gHashCheckSumBuffer);
+    uint stCellBaseIdx = 0;
+    uint stCellSampleCount = 0;
+    if (stCellIdx != -1)
+    {
+        stCellBaseIdx = gHashIndexBuffer.Load(uint(stCellIdx) * 4);
+        stCellSampleCount = gHashCellCounters.Load(uint(stCellIdx) * 4);
+    }
+    uint stHashIncrement = max(1u, (stCellSampleCount + numSamples - 1) / numSamples);
+    uint stHashOffset = uint(round(sampleNext1D(sg) * float(max(1u, stHashIncrement) - 1)));
+    uint stHashSpatialIdx = 0; // spatial 样本的计数器
+#endif
+
     for (uint i = 0; i < numSamples; i++)
     {
         cachedIndices[i] = 0xFFFFFFFF; //Set to max int
@@ -686,6 +774,36 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
         }
         else
         {
+#if USE_WORLD_SPACE_HASH_GRID
+            // World Space Hash Grid 邻居查找（spatial 部分）
+            if (stCellIdx != -1 && stCellSampleCount > 0)
+            {
+                uint storageIdx = (stHashOffset + stHashSpatialIdx * stHashIncrement) % stCellSampleCount;
+                stHashSpatialIdx++;
+                uint neighborLinearIdx = gHashCellStorage[stCellBaseIdx + storageIdx];
+                idx = int2(neighborLinearIdx % gFrameDim.x, neighborLinearIdx / gFrameDim.x);
+
+                // 跳过自身
+                if (all(idx == int2(pixel)))
+                    continue;
+
+                // 边界检查
+                if(any(idx < 0) || any(idx >= gFrameDim))
+                    continue;
+
+                // 获取上一帧的 surface 并检查有效性
+                SurfaceFG neighSurface = getSurface(idx, true);
+                if (!neighSurface.valid)
+                    continue;
+
+                if (!surface.isValidNeighbor(neighSurface, gDepthThreshold, gNormalThreshold))
+                    continue;
+            }
+            else
+            {
+                continue; // 没有找到 cell，跳过
+            }
+#else
             //Get sample from sampling mask
             float2 randSamp = (sampleNext2D(sg) * 2.f) - 1.f; //random sample in [-1,1]
             int2 spatialOffset = int2(round(randSamp * gSamplingRadius));
@@ -702,6 +820,7 @@ void spatiotemporalResampling(uint2 pixel, inout SampleGenerator sg, inout Reser
         
             if (!surface.isValidNeighbor(neighSurface, gDepthThreshold, gNormalThreshold))
                 continue;
+#endif
         }
             
         //If neighbor surface has passed the tests get reservoir and compair them

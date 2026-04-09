@@ -36,6 +36,7 @@
 #include "Rendering/RTXDI/RTXDI.h"
 
 #include "Rendering/AccelerationStructure/CustomAccelerationStructure.h"
+#include "Utils/Algorithm/PrefixSum.h"
 
 using namespace Falcor;
 
@@ -152,6 +153,10 @@ private:
      */
     void collectPhotonsSplit(RenderContext* pRenderContext, const RenderData& renderData, ShaderVar& var, std::string profileName, bool fg);
 
+    /** World Space Hash Grid 构建流程
+    */
+    void buildWorldSpaceHashGrid(RenderContext* pRenderContext, const RenderData& renderData);
+
     /** Resampling pass, which resamples the generated sampled based on the resampling mode
     */
     void resamplingPass(RenderContext* pRenderContext, const RenderData& renderData);
@@ -242,6 +247,11 @@ private:
     uint mPairwiseMIS_N = 0;                                    // Pairwise MIS: 实际采样邻居数 N (覆盖 gSpatialSamples), 0 = 使用 gSpatialSamples
     bool mUseCausticsForIndirectLight = true;                  // Use Caustic photons as indirect light samples
 
+    // World Space Hash Grid
+    bool mUseWorldSpaceHashGrid = false;                        // 启用 World Space Hash Grid 进行 spatial resampling
+    uint mHashGridDimension = 80;                               // Hash Grid 场景划分维度
+    uint mHashTableSize = 100000;                               // Hash Table 大小（cell 数量）
+
 
     //Photon
     uint mPhotonMaxBounces = 10;                                    //Number of Photon bounces
@@ -331,6 +341,13 @@ private:
     ref<Buffer> mpDirectFGSample[2];
     ref<Buffer> mpSampleGenState;       //SampleGeneratorState
 
+    // World Space Hash Grid Buffers
+    ref<Buffer> mpHashAppendBuffer[2];   // 每个像素的 HashAppendData
+    ref<Buffer> mpHashCellStorage[2];    // Cell 存储（像素索引数组）
+    ref<Buffer> mpHashIndexBuffer[2];    // PrefixSum 后的 cell 起始偏移
+    ref<Buffer> mpHashCheckSumBuffer[2]; // Hash table checksum
+    ref<Buffer> mpHashCellCounters[2];   // Cell 计数器
+
     ref<Texture> mpVBufferDI;          // Work copy for VBuffer (RTXDI or DirectAnalytical)
     ref<Texture> mpViewDirRayDistDI;   // View dir tex (RTXDI or DirectAnalytical)
     ref<Texture> mpViewDirDIPrev;      // Previous View dir for direct surfaces
@@ -368,6 +385,9 @@ private:
     RayTraceProgramHelper mGeneratePhotonPass;
     RayTraceProgramHelper mCollectPhotonPass;
 
+    std::unique_ptr<PrefixSum> mpPrefixSum;              // PrefixSum 用于 Hash Grid 构建
+    ref<ComputePass> mpRegisterHashGridPass;             // 注册像素到 Hash Grid
+    ref<ComputePass> mpBuildHashGridPass;                // 构建 Hash Grid Cell Storage
     ref<ComputePass> mpResamplingPass;                  // Resampling Pass for all resampling modes
     ref<ComputePass> mpCausticResamplingPass;           // Resampling Pass for Caustics
     ref<ComputePass> mpFinalShadingPass;                // Final Shading Pass
