@@ -14,6 +14,8 @@ def render_graph_ReSTIR_FG():
     g.add_edge('ReSTIR_FG.color', 'AccumulatePass.input')
     g.mark_output('ToneMapper.dst')
     g.mark_output('AccumulatePass.output')
+    g.mark_output('ReSTIR_FG.directLighting')
+    g.mark_output('ReSTIR_FG.indirectLighting')
     return g
 m.addGraph(render_graph_ReSTIR_FG())
 

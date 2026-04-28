@@ -408,4 +408,9 @@ private:
     ref<ComputePass> mpCausticResamplingPass;           // Resampling Pass for Caustics
     ref<ComputePass> mpFinalShadingPass;                // Final Shading Pass
     ref<ComputePass> mpDirectAnalyticPass;              // Direct Analytic as an alternative to ReSTIR
+
+    // 导出帧相关
+    bool mExportFrameRequested = false;                  // 是否有导出请求
+    std::filesystem::path mExportFramePath;              // 导出文件路径
+    Bitmap::FileFormat mExportFrameFormat = Bitmap::FileFormat::PngFile; // 导出文件格式
 };

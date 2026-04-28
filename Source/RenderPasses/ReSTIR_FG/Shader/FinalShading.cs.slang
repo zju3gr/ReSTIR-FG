@@ -52,6 +52,8 @@ RWTexture2D<float4> gOutSpecularRadiance;
 Texture2D<float4> gOutDiffuseReflectance;
 Texture2D<float4> gOutSpecularReflectance;
 RWTexture2D<float4> gOutResidualRadiance;
+RWTexture2D<float4> gOutDirectLighting;
+RWTexture2D<float4> gOutIndirectLighting;
 
 //For view copy
 RWTexture2D<float4> gViewDIPrev;
@@ -139,6 +141,12 @@ void main(uint2 pixel : SV_DispatchThreadID)
     float3 dir = { };
     float3 Li = { };
 
+    // 分别追踪直接光和间接光分量
+    float3 directDiffuse = { };   // RTXDI 直接光 diffuse 分量
+    float3 directSpecular = { };  // RTXDI 直接光 specular 分量
+    float3 indirectDiffuse = { }; // FG 间接光 diffuse 分量
+    float3 indirectSpecular = { }; // FG 间接光 specular 分量
+
     bool validSample = false;
 
     #if STORE_SAMPLE_GEN_STATE
@@ -184,10 +192,14 @@ void main(uint2 pixel : SV_DispatchThreadID)
         if (rtxdiValid)
         {
             sd.mtl.setActiveLobes((uint) LobeType::DiffuseReflection);
-            diffuse += bsdf.eval(sd, dir, sg) * Li * thp;
+            float3 rtxdiDiff = bsdf.eval(sd, dir, sg) * Li * thp;
+            diffuse += rtxdiDiff;
+            directDiffuse += rtxdiDiff;
 
             sd.mtl.setActiveLobes((uint) LobeType::SpecularReflection);
-            specular += bsdf.eval(sd, dir, sg) * Li * thp;
+            float3 rtxdiSpec = bsdf.eval(sd, dir, sg) * Li * thp;
+            specular += rtxdiSpec;
+            directSpecular += rtxdiSpec;
 
             hitT = distance;
             hitTSpec = distance;
@@ -260,7 +272,10 @@ void main(uint2 pixel : SV_DispatchThreadID)
             float3 giDiff = bsdf.eval(sd, dir, sg) * Li * thp;
             
             sd.mtl.setActiveLobes((uint) LobeType::SpecularReflection);
-            specular += bsdf.eval(sd, dir, sg) * Li * thp;
+            float3 giSpec = bsdf.eval(sd, dir, sg) * Li * thp;
+            specular += giSpec;
+            indirectDiffuse += giDiff;
+            indirectSpecular += giSpec;
 
             //HitT handling
             if(!wasTraced){
@@ -363,5 +378,19 @@ void main(uint2 pixel : SV_DispatchThreadID)
     if (is_valid(gOutEmission)) gOutEmission[pixel] = float4(emission, 1.f);
     if (is_valid(gOutDiffuseRadiance)) gOutDiffuseRadiance[pixel] = float4(diffuseIllumination, hitT);
     if (is_valid(gOutSpecularRadiance))gOutSpecularRadiance[pixel] = float4(specularIllumination, hitTSpec);
-    if (is_valid(gOutResidualRadiance))  gOutResidualRadiance[pixel] = float4(0.f); //TODO 
+    if (is_valid(gOutResidualRadiance))  gOutResidualRadiance[pixel] = float4(0.f); //TODO
+
+    // 输出直接光和间接光分量
+    // 直接光 = RTXDI直接光照(directDiffuse + directSpecular) + emission
+    // 间接光 = ReSTIR FG间接光照(indirectDiffuse + indirectSpecular) + caustic
+    if (is_valid(gOutDirectLighting))
+    {
+        float3 directLight = directDiffuse + directSpecular + emission;
+        gOutDirectLighting[pixel] = float4(directLight, 1.f);
+    }
+    if (is_valid(gOutIndirectLighting))
+    {
+        float3 indirectLight = indirectDiffuse + indirectSpecular + caustic;
+        gOutIndirectLighting[pixel] = float4(indirectLight, 1.f);
+    }
 }

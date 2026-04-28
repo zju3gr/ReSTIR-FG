@@ -84,6 +84,8 @@ struct PathTracer
     NRDBuffers outputNRD;                           ///< Output NRD data.
 
     RWTexture2D<float4> outputColor;                ///< Output color buffer if kSamplesPerPixel == 1.
+    RWTexture2D<float4> outputDirectLighting;         ///< Output direct lighting buffer.
+    RWTexture2D<float4> outputIndirectLighting;       ///< Output indirect lighting buffer.
 
     /*******************************************************************
                                 Static members
@@ -99,6 +101,8 @@ struct PathTracer
 
     // Additional specialization.
     static const bool kOutputGuideData = OUTPUT_GUIDE_DATA;
+
+    static const bool kOutputDirectIndirectLighting = OUTPUT_DIRECT_INDIRECT_LIGHTING;
 
     /** Types of samplable lights.
     */
@@ -276,6 +280,7 @@ struct PathTracer
         path.setActive();
         path.id = pathID;
         path.thp = float3(1.f);
+        path.Ldirect = float3(0.f);
 
         const uint2 pixel = path.getPixel();
 
@@ -866,6 +871,12 @@ struct PathTracer
             // Accumulate emitted radiance weighted by path throughput and MIS weight.
             addToPathContribution(path, misWeight * bsdfProperties.emission);
 
+            // 直接光：primary hit 的 emission 属于直接光
+            if (isPrimaryHit)
+            {
+                path.Ldirect += path.thp * misWeight * bsdfProperties.emission;
+            }
+
             attenuatedEmission = path.thp * misWeight * bsdfProperties.emission;
         }
 
@@ -957,7 +968,15 @@ struct PathTracer
 
                     logTraceRay(PixelStatsRayType::Visibility);
                     bool visible = vq.traceVisibilityRay(ray);
-                    if (visible) addToPathContribution(path, Lr);
+                    if (visible)
+                    {
+                        addToPathContribution(path, Lr);
+                        // 直接光：primary hit 上的 NEE/RTXDI 贡献属于直接光
+                        if (isPrimaryHit)
+                        {
+                            path.Ldirect += path.thp * Lr;
+                        }
+                    }
                 }
             }
         }
@@ -1058,6 +1077,12 @@ struct PathTracer
             emitterRadiance = misWeight * Le;
             addToPathContribution(path, emitterRadiance);
 
+            // 直接光：primary miss 的环境光属于直接光（vertex 1 = primary hit miss）
+            if (path.getVertexIndex() == 1)
+            {
+                path.Ldirect += path.thp * emitterRadiance;
+            }
+
             if (kOutputGuideData && path.getVertexIndex() == 2
                 && (path.getBounces(BounceType::Specular) == 1
                 || path.getBounces(BounceType::Transmission) == 1))
@@ -1119,6 +1144,13 @@ struct PathTracer
         {
             // Write color directly to frame buffer.
             outputColor[pixel] = float4(path.L, 1.f);
+
+            // 输出直接光和间接光分量
+            if (kOutputDirectIndirectLighting)
+            {
+                outputDirectLighting[pixel] = float4(path.Ldirect, 1.f);
+                outputIndirectLighting[pixel] = float4(max(float3(0.f), path.L - path.Ldirect), 1.f);
+            }
         }
         else
         {

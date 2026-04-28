@@ -79,6 +79,8 @@ namespace
     const std::string kOutputNRDDeltaTransmissionPathLength = "nrdDeltaTransmissionPathLength";
     const std::string kOutputNRDDeltaTransmissionPosW = "nrdDeltaTransmissionPosW";
     const std::string kOutputNRDResidualRadianceHitDist = "nrdResidualRadianceHitDist";
+    const std::string kOutputDirectLighting = "directLighting";
+    const std::string kOutputIndirectLighting = "indirectLighting";
 
     const Falcor::ChannelList kOutputChannels =
     {
@@ -109,6 +111,8 @@ namespace
         { kOutputNRDDeltaTransmissionPathLength,            "",     "Output delta transmission path length", true /* optional */, ResourceFormat::R16Float },
         { kOutputNRDDeltaTransmissionPosW,                  "",     "Output delta transmission position", true /* optional */, ResourceFormat::RGBA32Float },
         { kOutputNRDResidualRadianceHitDist,                "",     "Output residual color (linear) and hit distance", true /* optional */, ResourceFormat::RGBA32Float },
+        { kOutputDirectLighting,                             "",     "Output direct lighting", true /* optional */, ResourceFormat::RGBA32Float },
+        { kOutputIndirectLighting,                           "",     "Output indirect lighting", true /* optional */, ResourceFormat::RGBA32Float },
     };
 
     // Scripting options.
@@ -1065,6 +1069,11 @@ void PathTracer::setShaderData(const ShaderVar& var, const RenderData& renderDat
     var["viewDir"] = pViewDir; // Can be nullptr
     var["sampleCount"] = pSampleCount; // Can be nullptr
     var["outputColor"] = renderData.getTexture(kOutputColor);
+    if (mOutputDirectIndirectLighting)
+    {
+        var["outputDirectLighting"] = renderData.getTexture(kOutputDirectLighting);
+        var["outputIndirectLighting"] = renderData.getTexture(kOutputIndirectLighting);
+    }
 
     if (useLightSampling && mpEmissiveSampler)
     {
@@ -1180,6 +1189,13 @@ bool PathTracer::beginFrame(RenderContext* pRenderContext, const RenderData& ren
         || renderData[kOutputNRDDeltaTransmissionPosW] != nullptr;
     if (mOutputNRDAdditionalData != prevOutputNRDAdditionalData) mRecompile = true;
 
+    // Check if direct/indirect lighting outputs should be generated.
+    bool prevOutputDirectIndirectLighting = mOutputDirectIndirectLighting;
+    mOutputDirectIndirectLighting =
+        renderData[kOutputDirectLighting] != nullptr
+        || renderData[kOutputIndirectLighting] != nullptr;
+    if (mOutputDirectIndirectLighting != prevOutputDirectIndirectLighting) mRecompile = true;
+
     // Enable pixel stats if rayCount or pathLength outputs are connected.
     if (renderData[kOutputRayCount] != nullptr || renderData[kOutputPathLength] != nullptr)
     {
@@ -1242,7 +1258,6 @@ void PathTracer::generatePaths(RenderContext* pRenderContext, const RenderData& 
     mpGeneratePaths->addDefine("OUTPUT_GUIDE_DATA", mOutputGuideData ? "1" : "0");
     mpGeneratePaths->addDefine("OUTPUT_NRD_DATA", mOutputNRDData ? "1" : "0");
     mpGeneratePaths->addDefine("OUTPUT_NRD_ADDITIONAL_DATA", mOutputNRDAdditionalData ? "1" : "0");
-
     // Bind resources.
     auto var = mpGeneratePaths->getRootVar()["CB"]["gPathGenerator"];
     setShaderData(var, renderData, false);
@@ -1267,7 +1282,6 @@ void PathTracer::tracePass(RenderContext* pRenderContext, const RenderData& rend
     tracePass.pProgram->addDefine("OUTPUT_GUIDE_DATA", mOutputGuideData ? "1" : "0");
     tracePass.pProgram->addDefine("OUTPUT_NRD_DATA", mOutputNRDData ? "1" : "0");
     tracePass.pProgram->addDefine("OUTPUT_NRD_ADDITIONAL_DATA", mOutputNRDAdditionalData ? "1" : "0");
-
     // Bind global resources.
     auto var = tracePass.pVars->getRootVar();
     mpScene->setRaytracingShaderData(pRenderContext, var);
@@ -1386,6 +1400,7 @@ DefineList PathTracer::StaticParams::getDefines(const PathTracer& owner) const
     defines.add("OUTPUT_GUIDE_DATA", "0");
     defines.add("OUTPUT_NRD_DATA", "0");
     defines.add("OUTPUT_NRD_ADDITIONAL_DATA", "0");
+    defines.add("OUTPUT_DIRECT_INDIRECT_LIGHTING", owner.mOutputDirectIndirectLighting ? "1" : "0");
 
     return defines;
 }

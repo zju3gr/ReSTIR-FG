@@ -38,6 +38,7 @@
 #include "Utils/UI/PixelZoom.h"
 #include "Utils/UI/InputState.h"
 #include "Utils/Scripting/Console.h"
+#include "Utils/Image/Bitmap.h"
 #include <filesystem>
 #include <memory>
 #include <string>

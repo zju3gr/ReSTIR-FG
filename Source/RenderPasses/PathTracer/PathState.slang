@@ -98,6 +98,7 @@ struct PathState
 
     float3      thp;                    ///< Path throughput.
     float3      L;                      ///< Accumulated path contribution.
+    float3      Ldirect;                ///< Accumulated direct lighting contribution.
 
     GuideData   guideData;              ///< Denoiser guide data.
     InteriorList interiorList;          ///< Interior list. Keeping track of a stack of materials with medium properties.

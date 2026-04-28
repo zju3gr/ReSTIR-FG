@@ -67,6 +67,8 @@ namespace
     const std::string kOutputDiffuseReflectance = "diffuseReflectance";
     const std::string kOutputSpecularReflectance = "specularReflectance";
     const std::string kOutputResidualRadiance = "residualRadiance";     //The rest (transmission, delta)
+    const std::string kOutputDirectLighting = "directLighting";
+    const std::string kOutputIndirectLighting = "indirectLighting";
 
     const Falcor::ChannelList kOutputChannels{
         {kOutputColor,                  "gOutColor",                "Output Color (linear)", true /*optional*/, ResourceFormat::RGBA32Float},
@@ -76,6 +78,8 @@ namespace
         {kOutputDiffuseReflectance,     "gOutDiffuseReflectance",   "Output primary surface diffuse reflectance", true /*optional*/, ResourceFormat::RGBA16Float},
         {kOutputSpecularReflectance,    "gOutSpecularReflectance",  "Output primary surface specular reflectance", true /*optional*/, ResourceFormat::RGBA16Float},
         {kOutputResidualRadiance,       "gOutResidualRadiance",     "Output residual color (transmission/delta)", true /*optional*/, ResourceFormat::RGBA32Float},
+        {kOutputDirectLighting,         "gOutDirectLighting",       "Output direct lighting", true /*optional*/, ResourceFormat::RGBA32Float},
+        {kOutputIndirectLighting,       "gOutIndirectLighting",     "Output indirect lighting", true /*optional*/, ResourceFormat::RGBA32Float},
     };
 
     //Properties for Render Graph
@@ -378,6 +382,18 @@ void ReSTIR_FG::execute(RenderContext* pRenderContext, const RenderData& renderD
         mPhotonCollectRadius *= sqrt((itF + mSPPMAlpha) / (itF + 1.0f));
 
         mSPPMFramesCameraStill++;
+    }
+
+    // 导出当前帧渲染结果（直接从 RenderGraph 输出纹理保存，不带 UI）
+    if (mExportFrameRequested)
+    {
+        auto pOutputTex = renderData[kOutputColor]->asTexture();
+        if (pOutputTex)
+        {
+            pOutputTex->captureToFile(0, 0, mExportFramePath, mExportFrameFormat, Bitmap::ExportFlags::None, false);
+            logInfo("ReSTIR_FG: Exported frame to {}", mExportFramePath.string());
+        }
+        mExportFrameRequested = false;
     }
 
     mReservoirValid = true;
@@ -766,6 +782,28 @@ void ReSTIR_FG::renderUI(Gui::Widgets& widget)
         changed |= group.checkbox("Use Stored Sample Gen State", mStoreSampleGenState);
         group.tooltip("Stores the Sample generator state and uses them for the next pass instead of generating a new one");
     }
+
+    // 导出当前帧渲染结果（直接从 RenderGraph 输出纹理保存，不带 UI，与 FrameCapture 行为一致）
+    if (widget.button("Export Frame"))
+    {
+        FileDialogFilterVec filters;
+        filters.push_back({"png", "PNG"});
+        filters.push_back({"exr", "EXR"});
+        filters.push_back({"pfm", "PFM"});
+        std::filesystem::path path;
+        if (saveFileDialog(filters, path))
+        {
+            std::string ext = path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            Bitmap::FileFormat format = Bitmap::FileFormat::PngFile;
+            if (ext == ".exr") format = Bitmap::FileFormat::ExrFile;
+            else if (ext == ".pfm") format = Bitmap::FileFormat::PfmFile;
+            mExportFrameRequested = true;
+            mExportFramePath = path;
+            mExportFrameFormat = format;
+        }
+    }
+    widget.tooltip("Export current frame to image file (linear HDR output, no UI, PNG/EXR/PFM)");
 
     mOptionsChanged |= changed;
 }

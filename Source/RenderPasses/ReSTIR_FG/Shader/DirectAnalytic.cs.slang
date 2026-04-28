@@ -21,6 +21,7 @@ RWTexture2D<float4> gOutDiffuseRadiance;
 RWTexture2D<float4> gOutSpecularRadiance;
 Texture2D<float4> gOutDiffuseReflectance;
 Texture2D<float4> gOutSpecularReflectance;
+RWTexture2D<float4> gOutDirectLighting;
 
 #define is_valid(name) (is_valid_##name != 0)
 
@@ -156,6 +157,12 @@ void main(uint2 pixel : SV_DispatchThreadID)
         if (is_valid(gOutSpecularRadiance)){
             specularIllumination.xyz += (specular * thp) / specularReflectance;
             gOutSpecularRadiance[pixel] = specularIllumination;
-        }     
+        }
+
+        // Analytic 光源属于直接光
+        if (is_valid(gOutDirectLighting)){
+            float3 prevDirect = gOutDirectLighting[pixel].xyz;
+            gOutDirectLighting[pixel] = float4(prevDirect + (diffuse + specular) * thp, 1.f);
+        }
     }
 }
