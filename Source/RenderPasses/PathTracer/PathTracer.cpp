@@ -1071,8 +1071,10 @@ void PathTracer::setShaderData(const ShaderVar& var, const RenderData& renderDat
     var["outputColor"] = renderData.getTexture(kOutputColor);
     if (mOutputDirectIndirectLighting)
     {
-        var["outputDirectLighting"] = renderData.getTexture(kOutputDirectLighting);
-        var["outputIndirectLighting"] = renderData.getTexture(kOutputIndirectLighting);
+        auto directLightingVar = var.findMember("outputDirectLighting");
+        auto indirectLightingVar = var.findMember("outputIndirectLighting");
+        if (directLightingVar.isValid()) directLightingVar = renderData.getTexture(kOutputDirectLighting);
+        if (indirectLightingVar.isValid()) indirectLightingVar = renderData.getTexture(kOutputIndirectLighting);
     }
 
     if (useLightSampling && mpEmissiveSampler)
