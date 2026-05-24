@@ -90,7 +90,8 @@ struct PathTracerParams
 
     uint    frameCount = 0;             ///< Frames rendered. This is used as random seed.
     uint    seed = 0;                   ///< Random seed. This will get updated from the host depending on settings.
-    uint2   _pad0;
+    uint    displayMode = 0;            ///< Display mode: 0=Full, 1=DirectOnly, 2=IndirectOnly.
+    uint    _pad0;
 
 #ifndef HOST_CODE
     /** Computes the offset into the tiled sample buffer for a given tile.

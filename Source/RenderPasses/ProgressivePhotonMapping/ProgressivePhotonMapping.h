@@ -3,23 +3,40 @@
 #include "RenderGraph/RenderPass.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Rendering/Lights/EmissiveLightSampler.h"
+#include "Utils/Algorithm/PrefixSum.h"
 
 using namespace Falcor;
 
 /**
  * Progressive Photon Mapping (PPM) render pass.
- * Implements "Progressive Photon Mapping: A Probabilistic Approach" (Knaus & Zwicker, TOG 2011)
+ * Supports two modes:
+ *
+ * Mode 1: "Memoryless" Probabilistic PPM (Knaus & Zwicker, TOG 2011)
+ *   - Global radius schedule: r_k = r_0 * k^{-(1-alpha)/2}
+ *   - Each frame is an independent density estimate: L_k = Phi / (pi * r_k^2)
+ *   - Final result: L = (1/N) * sum L_k (simple running average)
+ *   - NO per-pixel radius, NO per-pixel photon count, NO tau recursion
+ *   - Supports random camera paths each frame (glossy, DOF, motion blur)
+ *
+ * Mode 2: Standard SPPM (Hachisuka et al. 2009)
+ *   - Per-pixel radius reduction: Nnew = N + alpha*M, r_new^2 = r_old^2 * Nnew/(N+M)
+ *   - Tau accumulation: tau = (tau + Phi) * (r_new^2 / r_old^2)
+ *   - Requires per-pixel local photon statistics
  *
  * Algorithm:
- * 1. Camera Pass: Trace paths from camera to first diffuse surface (supports random glossy sampling)
+ * 1. Camera Pass: Trace paths from camera to first diffuse surface
  * 2. Photon Tracing Pass: Emit photons from light sources, store at diffuse surfaces
  * 3. Photon Collection Pass: Estimate radiance via photon density estimation
- * 4. Progressive radius reduction: r_{i+1}^2 = r_i^2 * (i + alpha) / (i + 1)
- * 5. Running average of per-frame radiance estimates
- *
- * Key advantage over standard SPPM: Each frame independently samples camera paths,
- * enabling correct handling of glossy surfaces, DOF, and motion blur.
  */
+/** Display mode for PPM output. */
+enum class PPMDisplayMode : uint32_t
+{
+    Full = 0,           // Direct + Indirect (default)
+    DirectOnly = 1,     // Direct lighting only
+    IndirectOnly = 2,   // Indirect lighting only (photon density estimation)
+    PhotonDirectTest = 3, // Sanity test: first-bounce photon map direct only (no NEE, depth==0 photons)
+};
+
 class ProgressivePhotonMapping : public RenderPass
 {
 public:
@@ -55,6 +72,9 @@ private:
     // Photon Tracing Pass: Emit photons from light sources
     void tracePhotonsPass(RenderContext* pRenderContext, const RenderData& renderData);
 
+    // Photon Sort Pass: Sort photons into contiguous memory by hash cell
+    void sortPhotonsPass(RenderContext* pRenderContext);
+
     // Photon Collection Pass: Collect photons for density estimation
     void collectPhotonsPass(RenderContext* pRenderContext, const RenderData& renderData);
 
@@ -81,14 +101,22 @@ private:
     float mSpecularRoughnessThreshold = 0.25f; // Surfaces below this roughness are treated as specular
 
     // Photon parameters
-    uint mPhotonMaxBounces = 10;            // Max photon bounces (increase to capture more indirect lighting)
-    uint mNumPhotonsPerFrame = 2000000;     // Photons emitted per frame (2 million)
-    uint mMaxPhotonBufferSize = 4000000;    // Photon buffer capacity (4 million, larger due to bounced photons)
+    uint mPhotonMaxBounces = 5;             // Max photon bounces
+    uint mNumPhotonsPerFrame = 500000;      // Photons emitted per frame (500K, balance quality/performance)
+    uint mMaxPhotonBufferSize = 5000000;    // Photon buffer capacity (5M)
+    uint mLastPhotonCount = 0;              // Last frame's actual photon count (for UI display)
 
     // PPM core parameters
-    float mInitialRadius = 0.1f;            // Initial search radius
+    float mInitialRadius = 0.05f;           // Initial search radius (smaller = less photons per pixel = faster)
     float mAlpha = 0.7f;                    // Radius reduction parameter alpha (standard SPPM recommends 0.7)
     bool mUseProbabilisticPPM = true;       // true = Probabilistic PPM (Knaus 2011), false = Standard SPPM (Hachisuka 2009)
+    PPMDisplayMode mDisplayMode = PPMDisplayMode::IndirectOnly; // Display mode: start with Indirect Only for testing
+
+    // ReSTIR parameters
+    bool mUseReSTIR = false;                // 是否启用 ReSTIR 优化光子收集
+    uint mTemporalMaxM = 20;                // 时间重采样最大 M 值（限制历史复用量，防止 temporal lag）
+    uint mSpatialNeighbors = 3;             // 空间重采样邻居数量
+    float mSpatialRadius = 10.0f;           // 空间重采样搜索半径（像素）
 
     // Light source parameters
     bool mHasLights = false;
@@ -100,9 +128,19 @@ private:
     // GPU resources
     //
     ref<Buffer> mpPixelStatsBuffer;         // Per-pixel persistent statistics (PPMPixelStats)
-    ref<Buffer> mpPhotonBuffer;             // Photon buffer
+    ref<Buffer> mpPhotonBuffer;             // Unsorted photon buffer (trace pass 写入)
     ref<Buffer> mpPhotonCounter;            // Photon counter
-    ref<Buffer> mpHashGrid;                 // Hash grid for spatial photon lookup
+    ref<Buffer> mpPhotonCounterStaging;     // Staging buffer for reading back photon count
+    ref<Buffer> mpCellCount;                // 每个 hash cell 的光子计数 → in-place prefix sum 后变为 offset table
+    ref<Buffer> mpCellCounter;              // Scatter pass 中的 per-cell atomic counter
+    ref<Buffer> mpSortedPhotonBuffer;       // Sorted photon buffer (按 cell 连续存储)
+    std::unique_ptr<PrefixSum> mpPrefixSum; // GPU parallel prefix sum utility
+
+    // ReSTIR resources
+    ref<Buffer> mpReservoirBuffer[2];       // 双缓冲 Reservoir (当前帧/上一帧)
+    ref<Texture> mpPositionBuffer[2];       // 双缓冲 position (当前帧/上一帧)
+    ref<Texture> mpNormalBuffer[2];         // 双缓冲 normal (当前帧/上一帧)
+    uint mReservoirFrameIndex = 0;          // 当前帧的 buffer index (0 or 1)
 
     //
     // Render programs
@@ -127,5 +165,7 @@ private:
 
     RayTraceProgramHelper mTraceCameraProgram;
     RayTraceProgramHelper mTracePhotonProgram;
+    ref<ComputePass> mpScatterPhotonsPass;
     ref<ComputePass> mpCollectPhotonsPass;
+    ref<ComputePass> mpReSTIRCollectPass;   // ReSTIR 版本的 Collect Pass
 };

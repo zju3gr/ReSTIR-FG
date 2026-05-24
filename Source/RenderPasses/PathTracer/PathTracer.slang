@@ -1142,10 +1142,19 @@ struct PathTracer
 
         if (kSamplesPerPixel == 1)
         {
-            // Write color directly to frame buffer.
-            outputColor[pixel] = float4(path.L, 1.f);
+            // Apply display mode to outputColor
+            float3 outColor;
+            if (params.displayMode == 1)
+                outColor = path.Ldirect;                              // Direct Only
+            else if (params.displayMode == 2)
+                outColor = max(float3(0.f), path.L - path.Ldirect);  // Indirect Only
+            else
+                outColor = path.L;                                    // Full
 
-            // 输出直接光和间接光分量
+            // Write color directly to frame buffer.
+            outputColor[pixel] = float4(outColor, 1.f);
+
+            // Output direct and indirect lighting components to separate channels
             if (kOutputDirectIndirectLighting)
             {
                 outputDirectLighting[pixel] = float4(path.Ldirect, 1.f);
@@ -1154,8 +1163,17 @@ struct PathTracer
         }
         else
         {
+            // Apply display mode for multi-sample path
+            float3 outColor;
+            if (params.displayMode == 1)
+                outColor = path.Ldirect;                              // Direct Only
+            else if (params.displayMode == 2)
+                outColor = max(float3(0.f), path.L - path.Ldirect);  // Indirect Only
+            else
+                outColor = path.L;                                    // Full
+
             // Write color to per-sample buffer.
-            sampleColor[outIdx].set(path.L);
+            sampleColor[outIdx].set(outColor);
         }
 
         if (kOutputGuideData)

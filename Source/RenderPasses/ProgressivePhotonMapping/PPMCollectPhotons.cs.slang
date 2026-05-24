@@ -2,10 +2,12 @@
  * PPM Photon Collection Shader (Compute)
  * Supports two modes via USE_PROBABILISTIC_PPM define:
  *
- * Mode 1 (USE_PROBABILISTIC_PPM = 1): Probabilistic PPM (Knaus & Zwicker, TOG 2011)
- *   - Each frame independently estimates radiance: L_i = photonContrib / (pi * r_i^2)
- *   - Running average across frames: L = (1/N) * sum L_i
- *   - Radius reduction: r_{i+1}^2 = r_i^2 * (i + alpha) / (i + 1)
+ * Mode 1 (USE_PROBABILISTIC_PPM = 1): "Memoryless" Probabilistic PPM (Knaus & Zwicker, TOG 2011)
+ *   - Global radius schedule: r_k = r_0 * k^{-(1-alpha)/2} (computed on CPU, passed as gCurrentRadius)
+ *   - Each frame independently estimates radiance: L_k = photonContrib / (pi * r_k^2)
+ *   - Running average across frames: L = (1/N) * sum L_k
+ *   - NO per-pixel radius, NO per-pixel photon count, NO tau recursion
+ *   - Only per-pixel state: radianceSum (sum of L_k) and emissionSum
  *   - Supports random camera paths each frame (glossy, DOF, motion blur)
  *
  * Mode 2 (USE_PROBABILISTIC_PPM = 0): Standard SPPM (Hachisuka et al. 2009)
@@ -40,7 +42,8 @@ cbuffer CB
     uint gNumPhotonsPerFrame;   // Number of photons emitted per frame
     float gAlpha;               // Radius reduction parameter alpha (0.6~0.9)
     float gCellSize;            // Hash grid cell size (= initial radius, for photon lookup)
-    uint _pad0;
+    float gCurrentRadius;       // Probabilistic PPM: global radius for this iteration (r_k = r_0 * k^{-(1-alpha)/2})
+    uint gDisplayMode;          // Display mode: 0=Full, 1=DirectOnly, 2=IndirectOnly
 }
 
 #if USE_EMISSIVE_LIGHTS
@@ -54,9 +57,10 @@ cbuffer EmissiveLight
 Texture2D<PackedHitInfo> gVBuffer;
 Texture2D<float4> gViewW;
 
-StructuredBuffer<PPMPhoton> gPhotonBuffer;
+StructuredBuffer<PPMPhotonSorted> gSortedPhotonBuffer;  // Sorted photon buffer（按 cell 连续存储）
 Buffer<uint> gPhotonCounter;
-Buffer<uint> gHashGrid;  // Hash grid: each cell stores the index of the first photon
+ByteAddressBuffer gCellOffset;   // 每个 cell 的起始偏移（prefix sum 结果，raw buffer）
+Buffer<uint> gCellCounter;       // 每个 cell 中实际写入 sorted buffer 的光子数量（scatter pass 的 atomic counter 结果）
 
 // Input/Output: per-pixel persistent statistics
 RWStructuredBuffer<PPMPixelStats> gPixelStats;
@@ -182,17 +186,22 @@ void writeEarlyExit(uint2 pixel, uint pixelIdx, float3 emission)
     ps.emissionSum += emission;
 
 #if USE_PROBABILISTIC_PPM
-    // Probabilistic PPM: increment iteration count and reduce radius
-    ps.N += 1.0;
-    float iterN = ps.N;
-    ps.radius2 = ps.radius2 * (iterN - 1.0 + gAlpha) / iterN;
-    ps.radius2 = max(ps.radius2, gInitialRadius * gInitialRadius * 0.0001f);
+    // Probabilistic PPM (Knaus & Zwicker 2011): Memoryless progressive photon mapping.
+    // No per-pixel radius or photon count needed. Radius is a global schedule.
+    // This frame contributes L_k = 0 (no photons found), just accumulate emission.
     gPixelStats[pixelIdx] = ps;
 
-    // Output: running average
-    float3 avgEmission = ps.emissionSum / ps.N;
-    float3 avgRadiance = ps.tau / max(ps.N, 1.0);
-    gOutputColor[pixel] = float4(avgEmission + avgRadiance, 1.f);
+    // Output: running average over (gFrameCount+1) iterations
+    float iter = float(gFrameCount + 1);
+    float3 avgEmission = ps.emissionSum / iter;
+    float3 avgRadiance = ps.tau / iter;
+
+    // Apply display mode
+    float3 result;
+    if (gDisplayMode == 1) result = avgEmission;       // Direct Only
+    else if (gDisplayMode == 2) result = avgRadiance;  // Indirect Only
+    else result = avgEmission + avgRadiance;           // Full
+    gOutputColor[pixel] = float4(result, 1.f);
 #else
     // Standard SPPM: no radius change when no photons found (M=0), no N change
     ps.radius2 = max(ps.radius2, gInitialRadius * gInitialRadius * 0.0001f);
@@ -202,7 +211,13 @@ void writeEarlyExit(uint2 pixel, uint pixelIdx, float3 emission)
     float iter = float(gFrameCount + 1);
     float3 direct = ps.emissionSum / iter;
     float3 indirect = ps.tau / (M_PI * ps.radius2 * iter);
-    gOutputColor[pixel] = float4(direct + indirect, 1.f);
+
+    // Apply display mode
+    float3 result;
+    if (gDisplayMode == 1) result = direct;            // Direct Only
+    else if (gDisplayMode == 2) result = indirect;     // Indirect Only
+    else result = direct + indirect;                   // Full
+    gOutputColor[pixel] = float4(result, 1.f);
 #endif
 }
 
@@ -258,6 +273,14 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
         isDiffuse = bsdfProperties.roughness > kRoughnessThreshold;
         hitPos = sd.posW;
         hitNormal = sd.getOrientedFaceNormal();
+
+        // Direct lighting via NEE (only for diffuse/glossy surfaces)
+        // In PhotonDirectTest mode (gDisplayMode == 3), skip NEE — use photon map for direct lighting
+        if (isDiffuse && gDisplayMode != 3)
+        {
+            emission += evalDirectAnalytic(sd, mi, sg);
+            emission += evalDirectEmissive(sd, mi, sg);
+        }
     }
 
     // If specular, trace camera path to find diffuse surface
@@ -307,7 +330,16 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             hitNormal = sd.getOrientedFaceNormal();
 
             if (isDiffuse)
+            {
+                // Direct lighting via NEE at the diffuse surface found after specular bounces
+                // In PhotonDirectTest mode (gDisplayMode == 3), skip NEE
+                if (gDisplayMode != 3)
+                {
+                    emission += throughput * evalDirectAnalytic(sd, nextMi, sg);
+                    emission += throughput * evalDirectEmissive(sd, nextMi, sg);
+                }
                 break;
+            }
 
             // Russian Roulette for camera path
             if (bounce >= 3)
@@ -344,22 +376,34 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
         ps.emissionSum = float3(0);
     }
 
+#if USE_PROBABILISTIC_PPM
+    // Probabilistic PPM: use global radius schedule r_k = r_0 * k^{-(1-alpha)/2}
+    // gCurrentRadius is computed on CPU side from iteration count
+    float currentRadius = gCurrentRadius;
+    float currentRadius2 = currentRadius * currentRadius;
+#else
+    // Standard SPPM: use per-pixel radius
     float currentRadius = sqrt(ps.radius2);
+    float currentRadius2 = ps.radius2;
+#endif
 
     // Re-acquire material instance for the final diffuse hit point
     let finalMi = gScene.materials.getMaterialInstance(sd, lod);
 
     // ========================================
-    // Photon density estimation using hash grid
+    // Photon density estimation using sorted photon array
+    // 使用连续内存访问替代 linked list 遍历，GPU 友好
     // ========================================
     float3 photonContrib = float3(0.f);
     uint photonCount = 0;  // M: number of photons found this frame
 
-    // Determine which hash grid cells to search
+
+    // 确定需要搜索的 hash grid cells
     int3 minCell = worldToCell(hitPos - float3(currentRadius), gCellSize);
     int3 maxCell = worldToCell(hitPos + float3(currentRadius), gCellSize);
 
-    // Iterate over neighboring cells
+
+    // 遍历邻近 cells
     for (int cz = minCell.z; cz <= maxCell.z; cz++)
     {
         for (int cy = minCell.y; cy <= maxCell.y; cy++)
@@ -369,41 +413,43 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
                 int3 cell = int3(cx, cy, cz);
                 uint cellIdx = hashGridCellIndex(cell);
 
-                // Traverse linked list of photons in this cell
-                uint photonIdx = gHashGrid[cellIdx];
-                uint maxIter = 512; // Safety limit to avoid infinite loops
-                while (photonIdx != HASH_GRID_INVALID && maxIter > 0)
+                // 从 offset table 获取该 cell 的起始位置和光子数量
+                uint cellStart = gCellOffset.Load(cellIdx * 4);
+                uint cellPhotonCount = min(gCellCounter[cellIdx], MAX_PHOTONS_PER_CELL);
+
+                // 连续内存访问：遍历该 cell 中的所有光子
+                for (uint i = 0; i < cellPhotonCount; i++)
                 {
-                    maxIter--;
-                    PPMPhoton photon = gPhotonBuffer[photonIdx];
+                    PPMPhotonSorted photon = gSortedPhotonBuffer[cellStart + i];
 
                     float3 diff = photon.posW - hitPos;
                     float distSq = dot(diff, diff);
 
-                    if (distSq < ps.radius2)
+
+                    if (distSq < currentRadius2)
                     {
-                        // Check normal direction consistency
+                        // 检查法线方向一致性
                         float NdotD = dot(hitNormal, photon.dirW);
                         if (NdotD > 0.01f)
                         {
-                            // Evaluate BSDF: eval returns f_r * cos(theta)
-                            // Photon mapping density estimation needs f_r only, divide by cos
+                            // Photon mapping density estimate:
+                            //   L += f_r(wo, wi) * photon.flux / (pi * r^2)
+                            // eval() returns f_r * cos(theta), so divide by cos to get pure f_r.
                             float3 bsdfVal = finalMi.eval(sd, photon.dirW, sg);
-                            float cosShading = abs(dot(sd.frame.N, photon.dirW));
-                            if (cosShading > 1e-4f)
-                                bsdfVal /= cosShading;
+                            float cosTheta = abs(dot(sd.frame.N, photon.dirW));
+                            if (cosTheta > 1e-4f)
+                                bsdfVal /= cosTheta;
 
-                            // Accumulate: beta * f_r * photon_flux
+                            // Accumulate: throughput * f_r * photon_flux
                             photonContrib += throughput * bsdfVal * photon.flux;
                             photonCount++;
                         }
                     }
-
-                    photonIdx = photon.nextInCell;
                 }
             }
         }
     }
+
 
     // ========================================
     // Progressive update - two modes
@@ -412,30 +458,31 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
 #if USE_PROBABILISTIC_PPM
     // ========================================
     // Mode 1: Probabilistic PPM (Knaus & Zwicker 2011)
-    // Per-frame radiance estimate: L_i = photonContrib / (pi * r_i^2)
-    // Running average: L = (1/N) * sum L_i
-    // Radius reduction: r_{i+1}^2 = r_i^2 * (N-1+alpha) / N
+    // "Memoryless" progressive photon mapping:
+    //   - Global radius schedule: r_k = r_0 * k^{-(1-alpha)/2}
+    //   - Per-frame independent radiance estimate: L_k = photonContrib / (pi * r_k^2)
+    //   - Final result: L = (1/N) * sum_{k=1}^{N} L_k
+    //   - No per-pixel radius, no per-pixel photon count, no tau recursion
     // ========================================
-    float3 frameRadiance = photonContrib / (M_PI * ps.radius2);
+    float3 frameRadiance = photonContrib / (M_PI * currentRadius2);
 
-    ps.tau += frameRadiance;  // tau stores radianceSum in probabilistic mode
+    // Accumulate into running sum (tau stores sum of all L_k)
+    ps.tau += frameRadiance;
     ps.emissionSum += emission;
-    ps.N += 1.0;
 
-    // Radius reduction for next iteration
-    float iterN = ps.N;
-    ps.radius2 = ps.radius2 * (iterN - 1.0 + gAlpha) / iterN;
-
-    // Clamp minimum radius
-    ps.radius2 = max(ps.radius2, gInitialRadius * gInitialRadius * 0.0001f);
-
-    // Write back
+    // Write back (no radius2 or N update needed in probabilistic mode)
     gPixelStats[pixelIdx] = ps;
 
-    // Output: running average
-    float3 avgEmission = ps.emissionSum / ps.N;
-    float3 avgRadiance = ps.tau / ps.N;
-    finalColor = avgEmission + avgRadiance;
+    // Output: running average over all iterations
+    float iter = float(gFrameCount + 1);
+    float3 avgEmission = ps.emissionSum / iter;
+    float3 avgRadiance = ps.tau / iter;
+
+    // Apply display mode
+    if (gDisplayMode == 1) finalColor = avgEmission;       // Direct Only
+    else if (gDisplayMode == 2) finalColor = avgRadiance;  // Indirect Only
+    else if (gDisplayMode == 3) finalColor = avgEmission + avgRadiance; // PhotonDirectTest: photon map direct + self-emission
+    else finalColor = avgEmission + avgRadiance;           // Full
 
 #else
     // ========================================
@@ -473,7 +520,12 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     float iter = float(gFrameCount + 1);
     float3 direct = ps.emissionSum / iter;
     float3 indirect = ps.tau / (M_PI * ps.radius2 * iter);
-    finalColor = direct + indirect;
+
+    // Apply display mode
+    if (gDisplayMode == 1) finalColor = direct;            // Direct Only
+    else if (gDisplayMode == 2) finalColor = indirect;     // Indirect Only
+    else if (gDisplayMode == 3) finalColor = direct + indirect; // PhotonDirectTest: photon map direct + self-emission
+    else finalColor = direct + indirect;                   // Full
 
 #endif
 

@@ -18,6 +18,9 @@ import FinalGatherData;
 #ifndef USE_RTXDI
     #define USE_RTXDI 1
 #endif
+#ifndef USE_INDIRECT_NONE
+#define USE_INDIRECT_NONE 0
+#endif
 #ifndef USE_RESTIR_GI
 #define USE_RESTIR_GI 1
 #endif
@@ -235,6 +238,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
 
         //Get reservoir
         bool validIndirectReservoir = true;
+    #if !USE_INDIRECT_NONE
         Reservoir r = Reservoir(gReservoir[pixel]);
     
         if (r.weightSum < 0 || r.M == 0)
@@ -242,6 +246,12 @@ void main(uint2 pixel : SV_DispatchThreadID)
             validIndirectReservoir = false;
         }
 
+    #else
+        // USE_INDIRECT_NONE: No indirect lighting, skip reservoir reading
+        validIndirectReservoir = false;
+    #endif // !USE_INDIRECT_NONE
+
+    #if !USE_INDIRECT_NONE
         if(validIndirectReservoir){
             getEmissiveLight(index2Dto1D(pixel, gFrameDim.x), sd.posW, distance, dir, Li);
             Li = max(0.f, Li * r.weightSum);
@@ -295,13 +305,14 @@ void main(uint2 pixel : SV_DispatchThreadID)
             
             diffuse += giDiff;
         }
+    #endif // !USE_INDIRECT_NONE
        
         //Add Emissive to additionally traced materials
         if(needEmissive)
             emission += bsdfProperties.emission * thp;
 
         // Add caustics
-        #if !USE_RESTIR_GI
+        #if !USE_RESTIR_GI && !USE_INDIRECT_NONE
             #if (USE_CAUSTIC_FILTER_RESERVOIR && !RESERVOIR_PHOTON_DIRECT) || !USE_CAUSTIC_FILTER_RESERVOIR
                 caustic += gCausticRadiance[pixel].xyz * thp;
             #endif
@@ -341,7 +352,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
                 diffuse += causticReservoirRadianceDiffuse * thp;
                 specular += causticResRadianceSpec * thp;
             #endif // USE_CAUSTIC_FILTER_RESERVOIR
-        #endif // !USE_RESTIR_GI
+        #endif // !USE_RESTIR_GI && !USE_INDIRECT_NONE
     }   
 
     if(validSample)

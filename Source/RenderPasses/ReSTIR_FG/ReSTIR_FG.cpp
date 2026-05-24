@@ -126,6 +126,7 @@ namespace
         {(uint)ReSTIR_FG::RenderMode::FinalGather, "Final Gather"},
         {(uint)ReSTIR_FG::RenderMode::ReSTIRGI, "ReSTIR GI"},
         {(uint)ReSTIR_FG::RenderMode::ReSTIRFG, "ReSTIR FG"},
+        {(uint)ReSTIR_FG::RenderMode::None, "None (Direct Only)"},
     };
 
     const Gui::DropdownList kDirectLightRenderModeList{
@@ -351,7 +352,7 @@ void ReSTIR_FG::execute(RenderContext* pRenderContext, const RenderData& renderD
         resamplingPass(pRenderContext, renderData);
     }
 
-    // 更新 Tile Guide（在 resampling 完成后，使用 reservoir winner 信息）
+    // Update Tile Guide (after resampling, using reservoir winner information)
     if (mUseTileGuide && (mRenderMode == RenderMode::ReSTIRFG || mRenderMode == RenderMode::FinalGather))
     {
         updateTileGuide(pRenderContext, renderData);
@@ -2309,6 +2310,7 @@ void ReSTIR_FG::finalShadingPass(RenderContext* pRenderContext, const RenderData
         defines.add("USE_RESTIR_GI", mRenderMode == RenderMode::ReSTIRGI ? "1" : "0");
         defines.add("RESERVOIR_PHOTON_DIRECT", mCausticResamplingForFGDirect ? "1" : "0");
         defines.add("USE_FINAL_GATHER", mRenderMode == RenderMode::FinalGather ? "1" : "0");
+        defines.add("USE_INDIRECT_NONE", mRenderMode == RenderMode::None ? "1" : "0");
         defines.add(getMaterialDefines());
 
         mpFinalShadingPass = ComputePass::create(mpDevice, desc, defines, true);
@@ -2324,6 +2326,7 @@ void ReSTIR_FG::finalShadingPass(RenderContext* pRenderContext, const RenderData
      mpFinalShadingPass->getProgram()->addDefine("USE_CAUSTIC_FILTER_RESERVOIR", mCausticCollectMode == CausticCollectionMode::Reservoir ? "1" : "0");
      mpFinalShadingPass->getProgram()->addDefine("RESERVOIR_PHOTON_DIRECT", mCausticResamplingForFGDirect ? "1" : "0");
      mpFinalShadingPass->getProgram()->addDefine("USE_FINAL_GATHER", mRenderMode == RenderMode::FinalGather ? "1" : "0");
+     mpFinalShadingPass->getProgram()->addDefine("USE_INDIRECT_NONE", mRenderMode == RenderMode::None ? "1" : "0");
      mpFinalShadingPass->getProgram()->addDefines(getMaterialDefines());
      // For optional I/O resources, set 'is_valid_<name>' defines to inform the program of which ones it can access.
      mpFinalShadingPass->getProgram()->addDefines(getValidResourceDefines(kOutputChannels, renderData));

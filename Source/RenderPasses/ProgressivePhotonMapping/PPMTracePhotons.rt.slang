@@ -27,6 +27,7 @@ cbuffer CB
     bool gUseAnalyticLights;
     float gCellSize;
     float gAnalyticLightRatio;  // Ratio of analytic light when using mixed light sources
+    uint gDisplayMode;          // Display mode: 3 = PhotonDirectTest (store depth==0 photons only)
 }
 
 #if USE_EMISSIVE_LIGHT
@@ -38,7 +39,7 @@ cbuffer Light
 
 RWStructuredBuffer<PPMPhoton> gPhotonBuffer;
 RWBuffer<uint> gPhotonCounter;
-RWBuffer<uint> gHashGrid;  // Hash grid: each cell stores the index of the first photon in that cell
+RWByteAddressBuffer gCellCount;  // 每个 hash cell 中的光子计数（raw buffer，用于后续 in-place prefix sum）
 
 static const uint kPhotonBufferSize = PHOTON_BUFFER_SIZE;
 static const float kRoughnessThreshold = ROUGHNESS_THRESHOLD;
@@ -277,10 +278,6 @@ void rayGen()
     // Photon tracing main loop
     for (uint i = 0; i < gMaxBounces; i++)
     {
-        // Early exit if photon buffer is already full
-        if (gPhotonCounter[0] >= kPhotonBufferSize)
-            return;
-
         TraceRay(gScene.rtAccel, 0, 0xff, 0, rayTypeCount, 0, ray, rayPayload);
 
         HitInfo hit = HitInfo(rayPayload.packedHitInfo);
@@ -297,28 +294,32 @@ void rayGen()
 
         bool isDiffuse = bsdfProperties.roughness > kRoughnessThreshold;
 
-        // Store photon at diffuse surface
-        // Store all photons reaching diffuse surfaces (including direct illumination photons)
-        // NEE in collect pass has been removed, all lighting is handled by photon density estimation
-        if (isDiffuse)
+        // Store photon at diffuse surface.
+        // Normal mode (gDisplayMode != 3): Only store indirect photons (i > 0).
+        //   i == 0 means the photon traveled directly from the light source to this surface
+        //   without any intermediate bounce — that direct illumination is handled by NEE.
+        // Sanity test mode (gDisplayMode == 3): Only store first-bounce photons (i == 0)
+        //   to test photon map direct lighting against NEE.
+        bool shouldStore = (gDisplayMode == 3) ? (i == 0) : (isDiffuse && i > 0);
+        if (shouldStore)
         {
             uint photonIdx = 0;
             InterlockedAdd(gPhotonCounter[0], 1u, photonIdx);
             if (photonIdx < kPhotonBufferSize)
             {
-                // Compute hash grid cell
+                // 计算 hash grid cell index
                 int3 cell = worldToCell(sd.posW, gCellSize);
                 uint cellIdx = hashGridCellIndex(cell);
 
-                // Insert into hash grid linked list (atomic exchange)
-                uint prevHead;
-                InterlockedExchange(gHashGrid[cellIdx], photonIdx, prevHead);
+                // 对该 cell 计数（用于后续 prefix sum）
+                gCellCount.InterlockedAdd(cellIdx * 4, 1u);
 
+                // 写入 unsorted photon buffer
                 PPMPhoton photon;
                 photon.posW = sd.posW;
+                photon.cellIndex = cellIdx;
                 photon.flux = photonFlux * thp;
                 photon.dirW = -ray.Direction;
-                photon.nextInCell = prevHead;
 
                 gPhotonBuffer[photonIdx] = photon;
             }

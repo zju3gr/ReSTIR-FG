@@ -613,6 +613,19 @@ bool PathTracer::renderRenderingUI(Gui::Widgets& widget)
 
     if (auto group = widget.group("Output options"))
     {
+        // Display mode dropdown
+        {
+            Gui::DropdownList displayModeList;
+            displayModeList.push_back({0u, "Full (Direct + Indirect)"});
+            displayModeList.push_back({1u, "Direct Only"});
+            displayModeList.push_back({2u, "Indirect Only"});
+            runtimeDirty |= widget.dropdown("Display Mode", displayModeList, mParams.displayMode);
+            widget.tooltip("Select which lighting component to display.\n"
+                           "Full: Direct + Indirect (default)\n"
+                           "Direct Only: Only direct lighting (NEE)\n"
+                           "Indirect Only: Only indirect lighting (bounced light)");
+        }
+
         // Switch to enable/disable path tracer output.
         dirty |= widget.checkbox("Enable output", mEnabled);
 

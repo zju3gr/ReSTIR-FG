@@ -4,7 +4,9 @@ target_sources(ProgressivePhotonMapping PRIVATE
     ProgressivePhotonMapping.cpp
     ProgressivePhotonMapping.h
     PPMTracePhotons.rt.slang
+    PPMScatterPhotons.cs.slang
     PPMCollectPhotons.cs.slang
+    PPMReSTIRCollect.cs.slang
     PPMParams.slang
 )
 

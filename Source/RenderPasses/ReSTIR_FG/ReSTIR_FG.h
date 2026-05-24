@@ -79,7 +79,8 @@ public:
     {
         FinalGather = 0,
         ReSTIRFG = 1u,
-        ReSTIRGI = 2u
+        ReSTIRGI = 2u,
+        None = 3u
     };
 
     enum class DirectLightingMode : uint
